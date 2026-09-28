@@ -2,13 +2,13 @@ import abc
 import ast
 import logging
 import os
+import sys
 
 import cv2
 import numpy as np
 from babeldoc.assets.assets import get_doclayout_onnx_model_path
 
 try:
-    import onnx
     import onnxruntime
 except ImportError as e:
     if "DLL load failed" in str(e):
@@ -27,6 +27,16 @@ _BACKEND_PROVIDERS = {
 }
 
 _preferred_backend: str | None = None
+
+
+def can_cache_optimized_graph(
+    providers: list[str], *, frozen: bool | None = None
+) -> bool:
+    """Cache only in a mutable source environment, never inside a release."""
+    if frozen is None:
+        frozen = bool(getattr(sys, "frozen", False))
+    compiled_providers = {"CoreMLExecutionProvider", "TensorrtExecutionProvider"}
+    return not frozen and not compiled_providers.intersection(providers)
 
 
 def set_backend(name: str) -> None:
@@ -91,13 +101,6 @@ class OnnxModel(DocLayoutModel):
         model_path = str(model_path)
         self.model_path = model_path
 
-        # Extract metadata without full model deserialization
-        model = onnx.load(model_path, load_external_data=False)
-        metadata = {d.key: d.value for d in model.metadata_props}
-        self._stride = ast.literal_eval(metadata["stride"])
-        self._names = ast.literal_eval(metadata["names"])
-        del model  # free memory before creating session
-
         sess_options = onnxruntime.SessionOptions()
         sess_options.graph_optimization_level = (
             onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -110,8 +113,7 @@ class OnnxModel(DocLayoutModel):
 
         # Providers like CoreML generate compiled nodes that cannot be
         # serialized, so only cache the optimized graph for CPU-only.
-        compiled_providers = {"CoreMLExecutionProvider", "TensorrtExecutionProvider"}
-        can_cache = not compiled_providers.intersection(providers)
+        can_cache = can_cache_optimized_graph(providers)
         if can_cache:
             optimized_path = model_path + ".optimized"
             if os.path.exists(optimized_path):
@@ -123,6 +125,16 @@ class OnnxModel(DocLayoutModel):
             model_path, sess_options, providers=providers
         )
         logger.info("ONNX Runtime providers: %s", self.model.get_providers())
+
+        # The session already parsed the model, so the stride and the class
+        # names come from it. Reading them with onnx.load instead meant a
+        # second full parse of a 75 MB protobuf on every start, and it pulled
+        # a package with a long path-traversal history into the import graph
+        # for the sake of two strings. The optimized graph keeps the same
+        # metadata, so this reads the same values either way.
+        metadata = self.model.get_modelmeta().custom_metadata_map
+        self._stride = ast.literal_eval(metadata["stride"])
+        self._names = ast.literal_eval(metadata["names"])
 
     @staticmethod
     def from_pretrained():

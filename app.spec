@@ -26,6 +26,7 @@ for optional in ("app/fonts", "app/assets"):
 datas += collect_data_files("customtkinter")
 datas += collect_data_files("tkinterdnd2")
 datas += collect_data_files("babeldoc")
+datas += collect_data_files("rapidocr")
 
 hiddenimports = [
     "peewee",
@@ -33,6 +34,15 @@ hiddenimports = [
     "pdf2zh.high_level",
     "pdf2zh.converter",
     "pdf2zh.translator",
+    "pdf2zh.ocr",
+    # RapidOCR exposes its entrypoint lazily and chooses this backend at
+    # runtime, so neither import is visible to PyInstaller's static scan.
+    "rapidocr.main",
+    "rapidocr.inference_engine.onnxruntime",
+    # Reached only through pdf2zh.high_level; naming them keeps the compiled
+    # extension and its vendored qpdf in the bundle even if that trail changes.
+    "pikepdf",
+    "pikepdf._core",
 ]
 
 analysis = Analysis(
@@ -43,7 +53,7 @@ analysis = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(ROOT / "app" / "runtime_hook_dlls.py")],
     excludes=[
         "matplotlib",
         "PyQt5",

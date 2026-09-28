@@ -1,6 +1,6 @@
 ---
 name: pdf-translate
-description: Translate local, text-based PDFs into Vietnamese or another supported Latin-script language while preserving the original layout, formulas, tables, and figures. Use for PDF translation, batch translation, terminology-sensitive handoff translation, or diagnosing incomplete translated output. Do not use for image-only scans that need OCR or targets requiring CJK, right-to-left, or complex-script shaping.
+description: Translate local PDFs, including safe prose on image-only scans, into Vietnamese or another supported Latin-script language while preserving layout, formulas, tables, and figures. Use for PDF translation, OCR-assisted scan translation, batch translation, terminology-sensitive handoff translation, or diagnosing incomplete output. Do not use for targets requiring CJK, right-to-left, or complex-script shaping.
 license: AGPL-3.0-only
 ---
 
@@ -37,7 +37,9 @@ Default to Google. Offer handoff when the user asks for higher quality, rejects 
 - Use the bundled `pdf2zh/` core. Never substitute the PyPI `pdf2zh` package; the runner checks version `1.9.11` and preservation ruleset `code4life-preservation-v1` and refuses an external core.
 - Google mode sends extracted document text to Google. Tell the user before processing sensitive material and obtain explicit confirmation unless their request already authorizes that disclosure. Handoff mode does not contact Google.
 - Supported targets are the Latin-script codes enforced by `scripts/translate_pdf.py`. CJK, right-to-left, Thai, Devanagari, and other complex-shaping targets are rejected because the bundled font and layout engine cannot render them reliably.
-- There is no OCR. If a source page is image-only, report that OCR is required instead of claiming it was translated.
+- OCR is opt-in with `--ocr standard|enhanced`. It fails closed on unsafe tables,
+  formulas, figures, code and ambiguous reading order; report every preserved
+  region as partial instead of claiming the whole scan was translated.
 - Text inside detected tables, figures, contents pages, indexes, symbol lists, or references may intentionally remain in the source language. Report material untranslated regions as partial translation.
 - Preserve the source. Write results to a separate output directory. Do not pass `--overwrite` without explicit replacement authorization.
 
@@ -63,7 +65,7 @@ python3 -m venv "<skill-root>/.venv"
 "<skill-root>/.venv/bin/python" -m pip install -r "<skill-root>/requirements.txt"
 ```
 
-Shared runner options include `--target-language` (default `vi`), `--source-language auto`, one-based `--pages 1,3-5`, `--threads 1..8` (default `4`), `--ignore-cache`, and `--overwrite`.
+Shared runner options include `--target-language` (default `vi`), `--source-language auto`, one-based `--pages 1,3-5`, `--threads 1..8` (default `4`; Google mode still sends one request at a time), `--ignore-cache`, and `--overwrite`.
 
 ## Google mode
 
@@ -81,7 +83,18 @@ macOS/Linux:
 "<skill-root>/.venv/bin/python" "<skill-root>/scripts/translate_pdf.py" "<input.pdf>" --output-dir "<output-dir>"
 ```
 
-For a batch, process files individually and report progress. A failure on one file must not stop the remaining files; collect and report all failures at the end.
+For a batch, process files individually and report progress. A file-specific
+failure must not stop the remaining files. A Google block or exhausted service
+outage pauses the whole queue; successful translations remain cached for a
+later retry, and no incomplete PDF is published for that interrupted file.
+
+Google mode sends a page's segments in one request, one request at a time, because the free endpoint blocks a network that floods it. Never run several Google jobs in parallel.
+
+If a run encounters HTTP 429 or a CAPTCHA, the runner stops the document and
+pauses the queue. For the next 10 minutes it refuses further Google runs before
+OCR/model work. This is the app's cooldown, not a prediction of Google's
+recovery time. Do not rerun it in a loop or try to get past the CAPTCHA. Report
+it, then offer a later rerun (finished segments are cached) or handoff mode.
 
 ## Handoff mode
 

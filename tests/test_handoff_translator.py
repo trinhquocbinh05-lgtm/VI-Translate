@@ -8,13 +8,35 @@ from pathlib import Path
 from pdf2zh.cache import clean_test_db, init_test_db
 from pdf2zh.translator import (
     FormulaPlaceholderError,
+    GoogleTranslator,
     HandoffTranslator,
+    NetworkBlock,
+    RequestPace,
+    SegmentTooLongError,
     encode_formula_placeholders,
+    has_unrepairable_mojibake,
     load_segment_table,
+    normalise_number_abbreviation,
+    repair_common_punctuation_mojibake,
     placeholders,
     restore_formula_placeholders,
     validate_style_tags,
 )
+
+
+UNDEFINED_IN_CP1252 = (0x81, 0x8D, 0x8F, 0x90, 0x9D)
+
+
+def _damage(value: str) -> str:
+    """UTF-8 bytes read as Windows-1252, the way a mishandled JSONL arrives.
+
+    A lenient reader passes the five undefined bytes through unchanged, so they
+    surface as C1 control characters rather than raising.
+    """
+    return "".join(
+        chr(byte) if byte in UNDEFINED_IN_CP1252 else bytes([byte]).decode("cp1252")
+        for byte in value.encode("utf-8")
+    )
 
 
 def _jsonl(path: Path, records: list[dict]) -> Path:
@@ -26,6 +48,56 @@ def _jsonl(path: Path, records: list[dict]) -> Path:
 
 
 class SegmentTableTests(unittest.TestCase):
+    def test_repairs_unambiguous_punctuation_mojibake_in_handoff_jsonl(self):
+        damaged = "13\u00e2\u20ac\u201c39 units; \u00c2\u00a9 source"
+        self.assertEqual(
+            repair_common_punctuation_mojibake(damaged),
+            "13–39 units; © source",
+        )
+        path = _jsonl(
+            self.root / "punctuation.jsonl",
+            [{"src": damaged, "dst": "13\u00e2\u20ac\u201c39 đơn vị; \u00c2\u00a9 nguồn"}],
+        )
+        self.assertEqual(
+            load_segment_table(str(path)),
+            {"13–39 units; © source": "13–39 đơn vị; © nguồn"},
+        )
+
+    def test_damaged_vietnamese_letters_leave_the_segment_untranslated(self):
+        """Guessing the letters back is refused, so the record is dropped.
+
+        A table that crossed the encoding boundary once loaded silently and put
+        unreadable text on the page while every gate reported success.
+        """
+        broken = _damage("các phân tử bám dính")
+        self.assertTrue(has_unrepairable_mojibake(broken))
+        path = _jsonl(self.root / "letters.jsonl", [
+            {"src": "cell adhesion molecules", "dst": broken},
+            {"src": "osteoblasts", "dst": "nguyên bào xương"},
+        ])
+        self.assertEqual(
+            load_segment_table(str(path)),
+            {"osteoblasts": "nguyên bào xương"},
+        )
+
+    def test_punctuation_repair_does_not_mask_damaged_letters(self):
+        """Repairing the dash first hid the damage in ten real records.
+
+        The repaired en dash is a byte that cannot begin a UTF-8 sequence, so
+        testing the repaired text reports the surrounding damage as clean.
+        """
+        broken = _damage("0–0.8 đơn vị mỗi mL")
+        self.assertNotEqual(repair_common_punctuation_mojibake(broken), broken)
+        self.assertTrue(has_unrepairable_mojibake(broken))
+        path = _jsonl(self.root / "mixed.jsonl", [{"src": "0–0.8 unit/mL", "dst": broken}])
+        self.assertEqual(load_segment_table(str(path)), {})
+
+    def test_correct_vietnamese_is_not_treated_as_mojibake(self):
+        """Â and Ã are Vietnamese letters, so a marker search drops good work."""
+        for value in ("CÁC PHÂN TỬ BÁM DÍNH TẾ BÀO", "Đã hấp thu 884–2050 nmol",
+                      "Osteoblasts", ""):
+            self.assertFalse(has_unrepairable_mojibake(value), value)
+
     def setUp(self) -> None:
         self.temp_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_directory.name)
@@ -70,11 +142,11 @@ class SegmentTableTests(unittest.TestCase):
     def test_legacy_converter_placeholders_are_normalised(self):
         path = _jsonl(
             self.root / "table.jsonl",
-            [{"src": "where {v0} holds", "dst": "nÆ¡i {v0} Ä‘Ãºng"}],
+            [{"src": "where {v0} holds", "dst": "nơi {v0} đúng"}],
         )
         self.assertEqual(
             load_segment_table(str(path)),
-            {"where <b0></b0> holds": "nÆ¡i <b0></b0> Ä‘Ãºng"},
+            {"where <b0></b0> holds": "nơi <b0></b0> đúng"},
         )
 
     def test_converter_placeholders_round_trip_through_safe_tags(self):
@@ -160,6 +232,65 @@ class HandoffTranslatorTests(unittest.TestCase):
         self.misses.write_text('{"src": "from an older run"}\n', encoding="utf-8")
         self._translator()
         self.assertEqual(self._recorded_misses(), [])
+
+
+class GoogleSegmentLengthTests(unittest.TestCase):
+    def test_a_segment_over_the_limit_is_refused_rather_than_truncated(self):
+        """Upstream sends the first 5000 characters and returns that as the whole
+        translation, so the rest of a long paragraph disappears with nothing said."""
+        translator = GoogleTranslator("en", "vi")
+        with self.assertRaises(SegmentTooLongError):
+            translator.do_translate("a" * 5001)
+
+    def test_a_segment_at_the_limit_is_still_sent(self):
+        translator = GoogleTranslator("en", "vi")
+        sent = {}
+
+        def fake_get(endpoint, params, headers, timeout):
+            sent["q"] = params["q"]
+            raise RuntimeError("stop before the network")
+
+        translator.session.get = fake_get
+        # Neither this machine's record of a Google block nor the shared pace.
+        translator.block = NetworkBlock()
+        translator.pace = RequestPace(sleep=lambda _seconds: None)
+        with self.assertRaises(RuntimeError):
+            translator.do_translate("a" * 5000)
+        self.assertEqual(len(sent["q"]), 5000)
+
+
+class NumberAbbreviationTests(unittest.TestCase):
+    """`no.` in front of a number means "number", never "not"."""
+
+    def test_the_abbreviation_is_capitalised_before_a_number(self):
+        self.assertEqual(
+            normalise_number_abbreviation("can be found in our brochure, ref. no. 305"),
+            "can be found in our brochure, ref. No. 305",
+        )
+
+    def test_every_occurrence_in_a_segment_is_capitalised(self):
+        self.assertEqual(
+            normalise_number_abbreviation("Part no. 12 and no. 13"),
+            "Part No. 12 and No. 13",
+        )
+
+    def test_a_space_before_the_number_is_allowed(self):
+        self.assertEqual(normalise_number_abbreviation("no.  7"), "No.  7")
+
+    def test_the_negation_is_left_alone(self):
+        self.assertEqual(
+            normalise_number_abbreviation("There is no. Then we stop."),
+            "There is no. Then we stop.",
+        )
+
+    def test_the_tail_of_a_longer_word_is_not_the_abbreviation(self):
+        self.assertEqual(
+            normalise_number_abbreviation("casino. 5 tables"),
+            "casino. 5 tables",
+        )
+
+    def test_already_capitalised_text_is_unchanged(self):
+        self.assertEqual(normalise_number_abbreviation("ref. No. 305"), "ref. No. 305")
 
 
 if __name__ == "__main__":

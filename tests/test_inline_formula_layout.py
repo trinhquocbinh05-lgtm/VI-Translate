@@ -9,31 +9,54 @@ because every line in a paragraph got the same leading.
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+
+import pymupdf
+import numpy as np
 
 from pdf2zh.converter import (
     IDENTITY_ORIENTATION,
     OpType,
     TextStyle,
+    available_height_below,
+    balanced_wrap_positions,
     line_offsets,
     matrix_font_size,
     normalised_text_matrix,
     operation_ink,
     paragraph_width_budget,
+    is_outside_page,
+    line_ends_paragraph,
+    glyph_layout_class,
+    output_font_lacks_glyph,
+    paragraph_source_leading,
+    run_is_prose,
+    stroke_colour_from_fill,
     preferred_translation,
+    rescale_operations,
+    rotated_glyph_geometry,
+    rotated_run_stands_alone,
     should_translate_rotated_text,
+    size_should_follow_body,
     styled_text_matrix,
     styled_character_text,
     text_fits_box_at_minimum_size,
     text_orientation,
+    text_style_from_descriptor,
     text_style_from_font,
+    text_style_of,
+    typical_line_pitch,
     uses_synthetic_bold,
     vertical_ink_extent,
     vertical_shift_to_bounds,
+    wrap_starts_new_item,
 )
 from pdf2zh.high_level import output_style_font_paths
-from pdf2zh.pdfinterp import PDFPageInterpreterEx
+from pdf2zh.converter import PDFConverterEx
+from pdf2zh.pdfinterp import PDFPageInterpreterEx, extgstate_is_safe
 from pdfminer.pdfinterp import PDFGraphicState, PDFResourceManager
+from pdfminer.psparser import PSLiteral
 
 
 class RecordingDevice:
@@ -63,6 +86,55 @@ def _stroke(scolor, ctm=(1, 0, 0, 1, 0, 0), linewidth=1.0, path=None):
 
 
 class FractionRuleTests(unittest.TestCase):
+    def test_short_numeric_title_orphan_triggers_gentle_rebalance(self):
+        text = "BEO PHI, HOI CHUNG CHUYEN HOA VA DAI THAO DUONG TYPE 2"
+        size, breaks = balanced_wrap_positions(
+            text, 0, 0, 220, 14, 7,
+            lambda _character, _style, candidate_size: candidate_size * 0.6,
+            [], balance_short_orphan=True,
+        )
+        self.assertLess(size, 14)
+        self.assertGreater(len(text[max(breaks):].split()), 1)
+
+    def test_protected_grid_rule_is_retained_in_original_content_stream(self):
+        device = RecordingDevice()
+        device.cur_item = SimpleNamespace(pageid=1)
+        device.layout = {1: np.zeros((100, 200))}
+        interpreter = PDFPageInterpreterEx(PDFResourceManager(), device, {})
+        interpreter.ctm = (1, 0, 0, 1, 0, 0)
+        interpreter.graphicstate = PDFGraphicState()
+        interpreter.curpath = [("m", 20, 40), ("l", 180, 40)]
+        self.assertIsNone(interpreter.do_S())
+        self.assertFalse(device.painted)
+
+    def test_model_edge_does_not_detach_initial_n_or_f_from_a_word(self):
+        # NASA source x=63.36; approximate prose region begins at x=66.
+        layout = np.ones((100, 200))
+        layout[30:60, 66:180] = 14
+        for right in (72.0, 67.36):
+            self.assertEqual(glyph_layout_class(layout, (63.36, 40, right, 52)), 14)
+
+    def test_model_edge_does_not_detach_caption_suffix_or_footnote(self):
+        # Ganong page 464: table-caption region x1=531.1, while the final
+        # "n.a" in "secretion.a" occupies x=533.1..545.7.
+        layout = np.ones((100, 600))
+        layout[20:90, 36:532] = 14
+        self.assertEqual(glyph_layout_class(layout, (533.12, 40, 538.98, 50)), 14)
+        self.assertEqual(glyph_layout_class(layout, (541.48, 38, 545.70, 46)), 14)
+
+    def test_edge_recovery_never_overrides_protected_formula(self):
+        layout = np.ones((100, 200))
+        layout[30:60, 66:180] = 0
+        self.assertEqual(glyph_layout_class(layout, (63.36, 40, 72, 52)), 0)
+        layout[40, 63] = 0
+        layout[30:60, 66:180] = 14
+        self.assertEqual(glyph_layout_class(layout, (63.36, 40, 72, 52)), 0)
+
+    def test_edge_recovery_does_not_attach_a_separate_gutter_glyph(self):
+        layout = np.ones((100, 200))
+        layout[30:60, 80:180] = 14
+        self.assertEqual(glyph_layout_class(layout, (63.36, 40, 72, 52)), 1)
+
     def test_a_rule_drawn_in_the_default_colour_is_moved_with_its_formula(self):
         # TeX emits no stroking-colour operator, so scolor stays None. Treating
         # that as "not black" left every inline fraction bar behind.
@@ -189,6 +261,98 @@ class LineOffsetTests(unittest.TestCase):
         )
 
 
+class AvailableHeightTests(unittest.TestCase):
+    """A translated paragraph is often a line or two longer than its source.
+
+    Charging that to the source box alone made paragraphs shrink even with white
+    space under them, and - once shrinking hit its floor - draw over the
+    paragraph below instead. Boxes are (x0, y0, x1, y1) with y increasing upward.
+    """
+
+    PARAGRAPH = (50.0, 700.0, 500.0, 740.0)  # 40pt tall, near the top of a page
+
+    def test_a_clear_page_below_lends_its_whole_gap(self):
+        self.assertAlmostEqual(
+            available_height_below(self.PARAGRAPH, [], floor=100.0), 640.0
+        )
+
+    def test_a_paragraph_directly_below_lends_only_the_real_gap(self):
+        below = (50.0, 600.0, 500.0, 680.0)  # its top is 20pt under our bottom
+        self.assertAlmostEqual(
+            available_height_below(self.PARAGRAPH, [below], floor=0.0), 60.0
+        )
+
+    def test_a_touching_paragraph_lends_nothing(self):
+        below = (50.0, 600.0, 500.0, 700.0)  # top exactly at our bottom edge
+        self.assertAlmostEqual(
+            available_height_below(self.PARAGRAPH, [below], floor=0.0), 40.0
+        )
+
+    def test_a_neighbour_in_another_column_is_not_an_obstacle(self):
+        beside = (520.0, 400.0, 560.0, 690.0)
+        self.assertAlmostEqual(
+            available_height_below(self.PARAGRAPH, [beside], floor=0.0), 740.0
+        )
+
+    def test_the_paragraph_itself_is_never_its_own_obstacle(self):
+        self.assertAlmostEqual(
+            available_height_below(self.PARAGRAPH, [self.PARAGRAPH], floor=0.0), 740.0
+        )
+
+    def test_the_nearest_of_several_obstacles_wins(self):
+        far = (50.0, 200.0, 500.0, 300.0)
+        near = (50.0, 600.0, 500.0, 680.0)
+        self.assertAlmostEqual(
+            available_height_below(self.PARAGRAPH, [far, near], floor=0.0), 60.0
+        )
+
+    def test_a_paragraph_never_gets_less_than_its_own_box(self):
+        overlapping = (50.0, 600.0, 500.0, 760.0)
+        self.assertGreaterEqual(
+            available_height_below(self.PARAGRAPH, [overlapping], floor=0.0), 40.0
+        )
+
+
+class ParagraphSizeTests(unittest.TestCase):
+    """A textbook list item is a 14pt bullet, a tab in the bullet's font, then
+    8.75pt body text. Taking the size from that tab typeset the whole item at
+    14pt; worse, the body then looked like a subscript against it, so the item
+    was preserved as a formula, never translated, and drawn over its
+    neighbours."""
+
+    BULLET = 14.0
+    BODY = 8.75
+
+    def test_the_first_real_letter_after_a_bullet_sets_the_size(self):
+        self.assertTrue(
+            size_should_follow_body(self.BULLET, self.BODY, visible_length=0, character="T")
+        )
+
+    def test_a_tab_or_space_never_sets_the_size(self):
+        for character in (" ",):
+            with self.subTest(character=character):
+                self.assertFalse(
+                    size_should_follow_body(
+                        self.BODY, self.BULLET, visible_length=0, character=character
+                    )
+                )
+
+    def test_the_second_letter_may_still_correct_the_first(self):
+        self.assertTrue(
+            size_should_follow_body(self.BULLET, self.BODY, visible_length=1, character="h")
+        )
+
+    def test_body_text_no_longer_moves_the_size_once_the_paragraph_has_started(self):
+        self.assertFalse(
+            size_should_follow_body(self.BODY, self.BODY, visible_length=9, character="e")
+        )
+
+    def test_a_larger_glyph_mid_paragraph_still_raises_the_size(self):
+        self.assertTrue(
+            size_should_follow_body(self.BODY, 20.0, visible_length=40, character="Q")
+        )
+
+
 class TableCellFitTests(unittest.TestCase):
     @staticmethod
     def _measure(_character, size):
@@ -210,6 +374,49 @@ class TableCellFitTests(unittest.TestCase):
         self.assertFalse(
             text_fits_box_at_minimum_size("{v0}", 10, 10, 10, [20], self._measure)
         )
+
+
+class LineSpacingTests(unittest.TestCase):
+    """The RISKS report is set at 1.5 line spacing, 12 pt text on a 20.7 pt pitch."""
+
+    def test_the_pitch_is_the_usual_step_between_body_lines(self):
+        baselines = [700.0, 679.3, 658.6, 637.9, 617.2]
+        self.assertAlmostEqual(typical_line_pitch(baselines, 12.0), 20.7, places=1)
+        # A raised glyph a few points up, and a paragraph gap, do not set the pitch.
+        self.assertAlmostEqual(
+            typical_line_pitch(baselines + [703.5, 560.0], 12.0), 20.7, places=1
+        )
+        self.assertIsNone(typical_line_pitch([700.0], 12.0))
+
+    def test_ordinary_one_and_a_half_spacing_is_not_a_new_item(self):
+        """Every line of the report became a segment: 539 fragments instead of 144 paragraphs."""
+        self.assertFalse(wrap_starts_new_item(20.7, 12.0, 20.7))
+        self.assertTrue(wrap_starts_new_item(32.0, 12.0, 20.7))
+
+    def test_single_spaced_documents_split_exactly_as_before(self):
+        self.assertFalse(wrap_starts_new_item(14.4, 12.0, 14.4))
+        self.assertTrue(wrap_starts_new_item(19.0, 12.0, 14.4))
+        self.assertTrue(wrap_starts_new_item(19.0, 12.0, None))
+
+    def test_a_widely_spaced_paragraph_keeps_its_spacing_and_a_single_spaced_one_does_not_change(self):
+        """Rebuilt at 1.2 em, a 1.5-spaced report shrank into dense blocks with gaps below."""
+        self.assertAlmostEqual(paragraph_source_leading(20.7, 12.0, True), 1.725)
+        self.assertIsNone(paragraph_source_leading(14.4, 12.0, True))
+        self.assertIsNone(paragraph_source_leading(20.7, 12.0, False))
+        self.assertIsNone(paragraph_source_leading(None, 12.0, True))
+        self.assertEqual(paragraph_source_leading(60.0, 12.0, True), 2.5)
+
+    def test_a_numbered_heading_on_the_next_line_still_starts_its_own_paragraph(self):
+        """"5.0. Khung tiếp cận…" and "5.0.1. Từ domestic banking…" were merged."""
+        self.assertTrue(wrap_starts_new_item(20.7, 12.0, 20.7, "5.0.1. Từ dom"))
+        self.assertTrue(wrap_starts_new_item(20.7, 12.0, 20.7, "b) Ngân hàng"))
+        self.assertFalse(wrap_starts_new_item(20.7, 12.0, 20.7, "2019 was a y"))
+        self.assertFalse(wrap_starts_new_item(14.0, 12.0, 20.7, "5.0.1. Từ dom"))
+
+    def test_without_a_measured_pitch_the_old_gap_rule_applies(self):
+        """CJK regions get no pitch: test_1 lost the circle around "2" when its lines were joined."""
+        self.assertTrue(wrap_starts_new_item(31.0, 12.0, None, "异；"))
+        self.assertTrue(wrap_starts_new_item(39.0, 12.0, None, "2将收货清单"))
 
 
 class OrientationAndStyleTests(unittest.TestCase):
@@ -259,6 +466,44 @@ class OrientationAndStyleTests(unittest.TestCase):
         self.assertFalse(should_translate_rotated_text("Ref. no. 304-2"))
         self.assertTrue(should_translate_rotated_text("Designation"))
 
+    @staticmethod
+    def _rotated_line(baseline: float, start: float, words: int, size: float = 8.0):
+        """Glyph geometry for one sideways line: (start, end, baseline) per glyph."""
+        return [(start + index * size * 0.5, start + (index + 1) * size * 0.5, baseline)
+                for index in range(words * 6)]
+
+    def test_rotated_geometry_follows_the_reading_direction(self):
+        glyph = SimpleNamespace(x0=100.0, y0=200.0, x1=108.0, y1=205.0,
+                                matrix=(0, 8, -8, 0, 107.0, 200.0))
+        start, end, baseline = rotated_glyph_geometry(glyph, (0.0, 1.0, -1.0, 0.0))
+        self.assertEqual((start, end), (200.0, 205.0))
+        self.assertEqual(baseline, -107.0)
+
+    def test_an_isolated_rotated_heading_is_rebuilt(self):
+        heading = self._rotated_line(100.0, 0.0, 1)
+        # The next column's heading sits a column's width away, not a line's.
+        neighbour = self._rotated_line(125.0, 0.0, 1)
+        self.assertTrue(rotated_run_stands_alone(heading, neighbour, 8.0))
+
+    def test_a_wrapped_rotated_table_cell_keeps_its_source_glyphs(self):
+        """Combatting page 6: two lines of one sideways cell, 9 pt apart."""
+        first = self._rotated_line(100.0, 0.0, 4)
+        second = self._rotated_line(109.0, 0.0, 3)
+        self.assertFalse(rotated_run_stands_alone(first, second, 8.0))
+        self.assertFalse(rotated_run_stands_alone(second, first, 8.0))
+        # Handed over as one region, sorting them along the baseline interleaved them.
+        self.assertFalse(rotated_run_stands_alone(first + second, [], 8.0))
+
+    def test_a_rotated_line_cut_between_regions_is_not_translated_as_a_fragment(self):
+        """"Hy" alone came back as "Xin chào"; the rest of its word sat in another region."""
+        line = self._rotated_line(100.0, 0.0, 3)
+        self.assertFalse(rotated_run_stands_alone(line[:2], line[2:], 8.0))
+
+    def test_two_cells_on_one_rotated_baseline_are_not_one_line(self):
+        first = self._rotated_line(100.0, 0.0, 2)
+        second = self._rotated_line(100.0, 150.0, 1)
+        self.assertFalse(rotated_run_stands_alone(first + second, [], 8.0))
+
     def test_synthetic_italic_composes_with_rotation(self):
         self.assertEqual(
             styled_text_matrix((0, 1, -1, 0), TextStyle.ITALIC, True),
@@ -269,7 +514,281 @@ class OrientationAndStyleTests(unittest.TestCase):
 
     def test_missing_style_faces_fall_back_to_the_regular_font(self):
         paths = output_style_font_paths("vi", "C:/missing/regular.ttf")
-        self.assertEqual(set(paths.values()), {"C:\\missing\\regular.ttf"})
+        self.assertEqual(set(paths.values()), {str(Path("C:/missing/regular.ttf"))})
+
+    def test_shrinking_a_paragraph_moves_its_runs_with_it(self):
+        """A line that shrinks must close up, not spread out.
+
+        Vietnamese splits a line into many runs, because every accented letter
+        comes from the Unicode font while the ASCII around it stays in the
+        base-14 face. Scaling only the size left each run at the coordinate the
+        old size had produced, so the gap in front of it grew by the width the
+        run gave up, and the gaps accumulated along the line: "Sức căng" came
+        out as "S ứ c c ă ng".
+        """
+        # "S|ứ|c c|ă|ng" at 10pt, each run placed after the previous one.
+        widths = [5.0, 6.0, 11.0, 6.0, 12.0]
+        x = 100.0
+        operations = []
+        for width in widths:
+            operations.append(
+                {
+                    "type": OpType.TEXT,
+                    "font": "noto",
+                    "size": 10.0,
+                    "x": x,
+                    "dy": 0.0,
+                    "rtxt": "",
+                    "lidx": 0,
+                    "style": TextStyle.REGULAR,
+                }
+            )
+            x += width
+
+        rescale_operations(operations, 0.8, 100.0, 100.0)
+
+        self.assertEqual(operations[0]["x"], 100.0)
+        cursor = 100.0
+        for values, width in zip(operations, widths):
+            self.assertAlmostEqual(values["x"], cursor, places=6)
+            self.assertAlmostEqual(values["size"], 8.0, places=6)
+            cursor += width * 0.8
+
+    def test_shrinking_measures_every_line_from_its_own_left_edge(self):
+        """Only the first line may be indented; later lines start at x0."""
+        operations = [
+            {"type": OpType.TEXT, "font": "noto", "size": 10.0, "x": 120.0,
+             "dy": 0.0, "rtxt": "", "lidx": 0, "style": TextStyle.REGULAR},
+            {"type": OpType.TEXT, "font": "noto", "size": 10.0, "x": 130.0,
+             "dy": 0.0, "rtxt": "", "lidx": 1, "style": TextStyle.REGULAR},
+        ]
+
+        rescale_operations(operations, 0.5, 120.0, 100.0)
+
+        self.assertAlmostEqual(operations[0]["x"], 120.0, places=6)
+        self.assertAlmostEqual(operations[1]["x"], 115.0, places=6)
+
+    def test_shrinking_keeps_a_formula_together(self):
+        """Formula glyphs already scaled; their offsets have to follow.
+
+        Their size was scaled while the offsets holding them in place were not,
+        so a shrunk inline formula was drawn as small glyphs spread across the
+        width the full-size ones had occupied.
+        """
+        operations = [
+            {"type": OpType.TEXT, "font": "F1", "size": 9.0, "x": 200.0,
+             "dy": 0.0, "rtxt": "", "lidx": 0, "style": TextStyle.REGULAR},
+            {"type": OpType.TEXT, "font": "F1", "size": 6.0, "x": 206.0,
+             "dy": -2.0, "rtxt": "", "lidx": 0, "style": TextStyle.REGULAR},
+            {"type": OpType.LINE, "x": 200.0, "dy": 3.0, "linewidth": 0.4,
+             "xlen": 12.0, "ylen": 0.0, "lidx": 0},
+        ]
+
+        rescale_operations(operations, 0.5, 200.0, 200.0)
+
+        self.assertAlmostEqual(operations[1]["x"] - operations[0]["x"], 3.0)
+        self.assertAlmostEqual(operations[1]["dy"], -1.0)
+        self.assertAlmostEqual(operations[2]["xlen"], 6.0)
+        self.assertAlmostEqual(operations[2]["linewidth"], 0.2)
+        self.assertAlmostEqual(operations[2]["dy"], 1.5)
+
+    def test_a_glyph_parked_above_the_page_is_dropped(self):
+        """Stray off-page glyphs used to split a paragraph at every bold term.
+
+        They sit in no layout region, so they take the catch-all class; the
+        class change started a new paragraph, and the fragments each reflowed
+        inside their own width and printed over one another.
+        """
+        page = (0.0, 0.0, 584.0, 792.5)
+        stray = SimpleNamespace(x0=535.0, x1=537.6, y0=823.2, y1=832.0)
+        self.assertTrue(is_outside_page(stray, page))
+
+    def test_a_glyph_touching_the_edge_is_kept(self):
+        """Clipped is not invisible, and neither is a glyph with no page."""
+        page = (0.0, 0.0, 584.0, 792.5)
+        edge = SimpleNamespace(x0=580.0, x1=590.0, y0=100.0, y1=110.0)
+        inside = SimpleNamespace(x0=100.0, x1=110.0, y0=100.0, y1=110.0)
+        self.assertFalse(is_outside_page(edge, page))
+        self.assertFalse(is_outside_page(inside, page))
+        self.assertFalse(is_outside_page(edge, None))
+
+    def test_a_character_the_output_font_cannot_draw_is_preserved(self):
+        """A missing glyph draws as .notdef and extracts as U+0000.
+
+        The list markers of a chemistry textbook and the apostrophe in a
+        physiology textbook's own title were lost that way.
+        """
+        font = pymupdf.Font("probe", "app/assets/GoNotoKurrent-Regular.ttf")
+        self.assertTrue(output_font_lacks_glyph("➤", font))
+        self.assertTrue(output_font_lacks_glyph("☐", font))
+        self.assertFalse(output_font_lacks_glyph("ệ", font))
+        self.assertFalse(output_font_lacks_glyph("e", font))
+
+    def test_spaces_and_a_missing_font_are_never_preserved(self):
+        """Preserving a space would break a paragraph at every word."""
+        font = pymupdf.Font("probe", "app/assets/GoNotoKurrent-Regular.ttf")
+        self.assertFalse(output_font_lacks_glyph(" ", font))
+        self.assertFalse(output_font_lacks_glyph("", font))
+        self.assertFalse(output_font_lacks_glyph("➤", None))
+
+    def test_adobe_pro_abbreviates_the_slanted_face(self):
+        """MinionPro-It never spells the word, but it is italic all the same."""
+        self.assertEqual(text_style_from_font("MELNNC+MinionPro-It"), TextStyle.ITALIC)
+        self.assertEqual(text_style_from_font("MyriadPro-It"), TextStyle.ITALIC)
+        self.assertEqual(
+            text_style_from_font("MyriadPro-BoldIt"), TextStyle.BOLD_ITALIC
+        )
+        self.assertEqual(text_style_from_font("Times-Italic"), TextStyle.ITALIC)
+
+    def test_a_name_merely_ending_in_those_letters_is_not_italic(self):
+        for name in ("Bandit", "ABCUnit", "Inherit", "Univers-Light"):
+            self.assertEqual(text_style_from_font(name), TextStyle.REGULAR, name)
+
+    def test_the_font_descriptor_outranks_the_font_name(self):
+        """The embedded font says what it is; the name is only a label."""
+        self.assertEqual(
+            text_style_from_descriptor({"Flags": 68, "ItalicAngle": -11}),
+            TextStyle.ITALIC,
+        )
+        self.assertEqual(
+            text_style_from_descriptor({"Flags": 262148}), TextStyle.BOLD
+        )
+        self.assertEqual(
+            text_style_from_descriptor({"Flags": 262148 | 64}), TextStyle.BOLD_ITALIC
+        )
+        self.assertEqual(text_style_from_descriptor({"Flags": 4}), TextStyle.REGULAR)
+        self.assertIsNone(text_style_from_descriptor({}))
+        self.assertIsNone(text_style_from_descriptor(None))
+
+    def test_a_bold_face_the_descriptor_does_not_mark_bold_stays_bold(self):
+        """Google Docs: Flags 6 for TimesNewRomanPS-BoldMT, 70 for BoldItalicMT."""
+        def glyph(name, flags):
+            return SimpleNamespace(fontname=name, font=SimpleNamespace(descriptor={"Flags": flags}))
+
+        self.assertEqual(text_style_of(glyph("AAAAAA+TimesNewRomanPS-BoldMT", 6)), TextStyle.BOLD)
+        self.assertEqual(
+            text_style_of(glyph("CAAAAA+TimesNewRomanPS-BoldItalicMT", 70)), TextStyle.BOLD_ITALIC
+        )
+        self.assertEqual(text_style_of(glyph("DAAAAA+TimesNewRomanPS-ItalicMT", 68)), TextStyle.ITALIC)
+        self.assertEqual(text_style_of(glyph("BAAAAA+TimesNewRomanPSMT", 6)), TextStyle.REGULAR)
+        # Slant still belongs to the descriptor: an abbreviated italic name stays upright
+        # when the embedded font says it is upright.
+        self.assertEqual(text_style_of(glyph("MinionPro-It", 4)), TextStyle.REGULAR)
+
+    def test_only_the_newest_colour_of_each_kind_is_replayed(self):
+        """`rg` and `g` write the same slot, so replaying both lets the older win."""
+        device = PDFConverterEx(PDFResourceManager())
+        interpreter = PDFPageInterpreterEx(PDFResourceManager(), device, {})
+        interpreter.record_graphic("rg", [0.137, 0.122, 0.125])
+        interpreter.record_graphic("g", [0.0])
+        self.assertEqual(device.graphic_instruction, "0.000000 g")
+
+    def test_a_colourspace_is_replayed_in_front_of_its_components(self):
+        device = PDFConverterEx(PDFResourceManager())
+        interpreter = PDFPageInterpreterEx(PDFResourceManager(), device, {})
+        interpreter.record_graphic("cs", ["/CS0"])
+        interpreter.record_graphic("scn", [1.0, 0.0, 0.0])
+        self.assertEqual(device.graphic_instruction, "/CS0 cs 1.000000 0.000000 0.000000 scn")
+        # `rg` names its own space, so the stale one must not travel with it.
+        interpreter.record_graphic("rg", [0.0, 0.0, 1.0])
+        self.assertEqual(device.graphic_instruction, "0.000000 0.000000 1.000000 rg")
+
+    def test_a_saved_colour_comes_back_with_the_graphics_state(self):
+        device = PDFConverterEx(PDFResourceManager())
+        interpreter = PDFPageInterpreterEx(PDFResourceManager(), device, {})
+        interpreter.record_graphic("rg", [0.1, 0.1, 0.1])
+        device.push_graphic_state()
+        interpreter.record_graphic("rg", [0.9, 0.6, 0.0])
+        self.assertEqual(device.graphic_instruction, "0.900000 0.600000 0.000000 rg")
+        device.pop_graphic_state()
+        self.assertEqual(device.graphic_instruction, "0.100000 0.100000 0.100000 rg")
+
+    def test_synthetic_bold_strokes_in_the_colour_it_fills_with(self):
+        """The stroke is our own thickening, not something the source drew."""
+        self.assertEqual(
+            stroke_colour_from_fill("0.690000 0.020000 0.227000 rg"),
+            "0.690000 0.020000 0.227000 RG",
+        )
+        self.assertEqual(stroke_colour_from_fill("/CS0 cs 1.000000 scn"),
+                         "/CS0 CS 1.000000 SCN")
+
+    def test_a_line_stopping_short_of_its_column_ends_the_paragraph(self):
+        """The layout model returns a column, not a paragraph.
+
+        Without this the whole column translates as one block: indents go, the
+        gap between paragraphs goes, and the four answers to a multiple-choice
+        question run together on one line.
+        """
+        column = (300.0, 100.0, 548.0, 700.0)
+        self.assertTrue(line_ends_paragraph(360.0, column))
+        self.assertFalse(line_ends_paragraph(546.0, column))
+        # Three quarters of the measure is still a full line.
+        self.assertFalse(line_ends_paragraph(300.0 + 248.0 * 0.8, column))
+
+    def test_a_line_is_never_judged_without_a_column_to_judge_it_against(self):
+        self.assertFalse(line_ends_paragraph(360.0, None))
+        self.assertFalse(line_ends_paragraph(360.0, (300.0, 100.0, 300.0, 700.0)))
+
+    def test_a_long_run_of_words_is_body_text_not_a_subscript(self):
+        """A caption's label is set larger than its body, so the body reads as
+        small text against it and the whole caption stayed untranslated."""
+        self.assertTrue(
+            run_is_prose("Members of one of the cytokine receptor superfamilies")
+        )
+        self.assertTrue(run_is_prose("the solid lines represent the shape"))
+
+    def test_a_real_subscript_is_still_preserved(self):
+        for run in ("1", "2n", "max", "C6H12O6", "  ", "", "1994;330:839"):
+            self.assertFalse(run_is_prose(run), run)
+
+    def test_a_graphics_state_that_only_mixes_colour_is_replayed(self):
+        """Overprint belongs to the text: it is why a CMYK black prints black."""
+        self.assertTrue(
+            extgstate_is_safe(
+                {"OP": True, "op": True, "OPM": 1, "BM": PSLiteral("Normal"),
+                 "ca": 1, "CA": 1, "SMask": PSLiteral("None")}
+            )
+        )
+        self.assertTrue(extgstate_is_safe({}))
+
+    def test_a_graphics_state_that_could_hide_the_text_is_left_behind(self):
+        """A page that reads as empty is worse than one whose black is a shade off."""
+        self.assertFalse(extgstate_is_safe({"ca": 0}))
+        self.assertFalse(extgstate_is_safe({"CA": 0.5}))
+        self.assertFalse(extgstate_is_safe({"SMask": {"Type": "Mask"}}))
+        self.assertFalse(extgstate_is_safe({"TR": {"FunctionType": 2}}))
+
+    def test_components_are_replayed_with_a_space_that_explains_them(self):
+        """`0 0 0 1 sc` is CMYK black, and DeviceGray 1 is white.
+
+        Replayed without the space it names components in, a chemistry
+        textbook's blue headings were drawn white on white paper.
+        """
+        device = PDFConverterEx(PDFResourceManager())
+        interpreter = PDFPageInterpreterEx(PDFResourceManager(), device, {})
+        interpreter.record_graphic("sc", [0.0, 0.0, 0.0, 1.0])
+        self.assertEqual(
+            device.graphic_instruction,
+            "/DeviceCMYK cs 0.000000 0.000000 0.000000 1.000000 sc",
+        )
+
+    def test_a_named_space_already_in_force_is_kept(self):
+        device = PDFConverterEx(PDFResourceManager())
+        interpreter = PDFPageInterpreterEx(PDFResourceManager(), device, {})
+        interpreter.record_graphic("cs", ["/CS1"])
+        interpreter.record_graphic("sc", [1.0, 1.0, 0.0, 0.0])
+        self.assertEqual(
+            device.graphic_instruction,
+            "/CS1 cs 1.000000 1.000000 0.000000 0.000000 sc",
+        )
+
+    def test_a_colour_that_cannot_be_replayed_is_dropped(self):
+        """Falling back to black beats drawing the run in a guessed colour."""
+        device = PDFConverterEx(PDFResourceManager())
+        interpreter = PDFPageInterpreterEx(PDFResourceManager(), device, {})
+        interpreter.record_graphic("rg", [0.1, 0.2, 0.3])
+        interpreter.record_graphic("scn", [PSLiteral("P0")])
+        self.assertEqual(device.graphic_instruction, "")
 
     def test_first_line_indent_is_deducted_from_width_budget(self):
         self.assertEqual(paragraph_width_budget(20, 10, 110, 1), 90)

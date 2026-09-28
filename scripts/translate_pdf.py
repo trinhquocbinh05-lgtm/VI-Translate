@@ -11,9 +11,13 @@ import shutil
 import sys
 import tempfile
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import NamedTuple
+from types import MappingProxyType
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from pdf2zh.high_level import TranslationReport
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 BUNDLED_CORE = (SKILL_ROOT / "pdf2zh").resolve()
@@ -36,6 +40,7 @@ TARGET_LANGUAGES = frozenset(
 )
 
 ENGINES = ("google", "handoff")
+OCR_MODES = ("off", "standard", "enhanced")
 
 # Measured on an eight-page sample: 2 threads 48s, 4 threads 30s, 8 threads 27s,
 # 12 threads 29s. Past four, the layout pass rather than the network is the floor,
@@ -53,6 +58,81 @@ class Translation(NamedTuple):
 
     path: Path | None
     untranslated: int = 0
+    reasons: Mapping[str, int] = MappingProxyType({})
+    image_only_pages: tuple[int, ...] = ()
+    ocr_pages: tuple[int, ...] = ()
+    ocr_profile: str = "off"
+    ocr_warnings: tuple[str, ...] = ()
+
+
+# record_translation_failure passes up either an exception class name or one of
+# the converter's fit rules. Reporting them as one sentence sent users to check
+# a network that was never the problem, so they are separated here.
+_FIT_MARKERS = ("font size", "cannot fit")
+_FORMULA_REASON = "FormulaPlaceholderError"
+_TOO_LONG_REASON = "SegmentTooLongError"
+_RATE_LIMITED_REASON = "RateLimitedError"
+_UNAVAILABLE_REASON = "ServiceUnavailableError"
+
+
+def _count_of_segments(count: int) -> str:
+    return f"{count} segment" if count == 1 else f"{count} segments"
+
+
+def _describe_failures(reasons: Mapping[str, int]) -> list[str]:
+    """Turn raw skip reasons into lines that say what the user can do."""
+    def is_fit(reason: str) -> bool:
+        return any(marker in reason for marker in _FIT_MARKERS)
+
+    fit = sum(count for reason, count in reasons.items() if is_fit(reason))
+    formula = reasons.get(_FORMULA_REASON, 0)
+    too_long = reasons.get(_TOO_LONG_REASON, 0)
+    rate_limited = reasons.get(_RATE_LIMITED_REASON, 0)
+    unavailable = reasons.get(_UNAVAILABLE_REASON, 0)
+    named = (_FORMULA_REASON, _TOO_LONG_REASON, _RATE_LIMITED_REASON, _UNAVAILABLE_REASON)
+    engine = {
+        reason: count
+        for reason, count in reasons.items()
+        if reason not in named and not is_fit(reason)
+    }
+
+    lines: list[str] = []
+    if fit:
+        lines.append(
+            f"{_count_of_segments(fit)} stayed in the source language because the "
+            "translation did not fit the original line at the smallest allowed size"
+        )
+    if formula:
+        lines.append(
+            f"{_count_of_segments(formula)} stayed in the source language because the "
+            "translation came back with damaged formula markers"
+        )
+    if too_long:
+        lines.append(
+            f"{_count_of_segments(too_long)} stayed in the source language because the "
+            "paragraph was longer than the translation service accepts in one request"
+        )
+    if rate_limited:
+        lines.append(
+            f"{_count_of_segments(rate_limited)} stayed in the source language because "
+            "Google Translate is refusing requests from this network (HTTP 429). No "
+            "request is sent until the block has had time to lift, since every request "
+            "into it prolongs it; translate the file again later. Unless --ignore-cache "
+            "was given, the segments that did translate are reused"
+        )
+    if unavailable:
+        lines.append(
+            f"{_count_of_segments(unavailable)} stayed in the source language because "
+            "Google Translate did not answer (no connection, a timeout, or a server "
+            "error). Check the connection and translate the file again"
+        )
+    if engine:
+        names = ", ".join(f"{name} x{count}" for name, count in sorted(engine.items()))
+        lines.append(
+            f"{_count_of_segments(sum(engine.values()))} stayed in the source language "
+            f"because the translation engine failed ({names})"
+        )
+    return lines
 
 
 def _positive_threads(value: str) -> int:
@@ -105,6 +185,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--threads", default=DEFAULT_THREADS, type=_positive_threads)
     parser.add_argument("--engine", default="google", choices=ENGINES)
     parser.add_argument(
+        "--ocr",
+        default="off",
+        choices=OCR_MODES,
+        help="experimental local OCR for image-only pages",
+    )
+    parser.add_argument(
         "--segments",
         type=Path,
         help='handoff engine: JSONL of {"src","dst"} records to translate from',
@@ -133,6 +219,11 @@ def _require_core() -> None:
     try:
         import pdf2zh
         importlib.import_module("pdf2zh.doclayout")
+        # high_level pulls in the native stack - pikepdf/qpdf, PyMuPDF, onnx.
+        # Without it a broken install slipped past this check and surfaced as a
+        # raw ImportError from the engine, once per file in the queue, instead
+        # of one actionable message before any work started.
+        importlib.import_module("pdf2zh.high_level")
     except ImportError as error:
         requirements = SKILL_ROOT / "requirements.txt"
         install = f'"{sys.executable}" -m pip install -r "{requirements}"'
@@ -233,6 +324,16 @@ def _layout_model(bundled_path: str | None) -> object:
         return _LAYOUT_MODEL[bundled_path]
 
 
+def load_layout_model() -> object:
+    """Build the inference session, raising if the native stack is unusable.
+
+    The packaged smoke test calls this: onnxruntime and its model are the
+    heaviest thing a frozen build has to load, and a bundle that cannot do it
+    is broken for every document, not just the first.
+    """
+    return _layout_model(os.environ.get("PDF_TRANSLATE_MODEL"))
+
+
 def preload_layout_model() -> None:
     """Build the inference session ahead of the first translation.
 
@@ -241,7 +342,7 @@ def preload_layout_model() -> None:
     it used to pay anyway.
     """
     try:
-        _layout_model(os.environ.get("PDF_TRANSLATE_MODEL"))
+        load_layout_model()
     except Exception:  # noqa: BLE001 - a warm-up failure must stay invisible
         pass
 
@@ -257,8 +358,11 @@ def _run_engine(
     engine: str,
     envs: dict[str, str],
     on_progress: Callable[[int, int], None] | None = None,
-) -> int:
-    """Run the core and return how many segments were left untranslated."""
+    skip_backing_pages: set[int] | None = None,
+    ocr_regions_by_page: dict | None = None,
+    on_status: Callable[[str, int, int], None] | None = None,
+) -> "TranslationReport":
+    """Run the core and return what it could not translate, and why."""
     from pdf2zh.high_level import translate
 
     # A packaged build ships the layout model so the first run needs no network.
@@ -270,7 +374,7 @@ def _run_engine(
         def callback(progress: object) -> None:
             on_progress(getattr(progress, "n", 0), getattr(progress, "total", 0) or 0)
 
-    result = translate(
+    arguments = dict(
         files=[str(source)],
         output=str(temp_output),
         pages=_pages_to_indices(pages),
@@ -283,9 +387,16 @@ def _run_engine(
         callback=callback,
         ignore_cache=ignore_cache,
     )
+    if on_status is not None:
+        arguments["on_status"] = on_status
+    if skip_backing_pages:
+        arguments["skip_backing_pages"] = skip_backing_pages
+    if ocr_regions_by_page:
+        arguments["ocr_regions_by_page"] = ocr_regions_by_page
+    result = translate(**arguments)
     if len(result) != 1:
         raise TranslationError("PDF core did not report one translated result")
-    return int(result[0][1] or 0)
+    return result[0][1]
 
 
 def translate_pdf(
@@ -301,10 +412,14 @@ def translate_pdf(
     engine: str = "google",
     segments: Path | None = None,
     emit_segments: Path | None = None,
+    ocr: str = "off",
     on_progress: Callable[[int, int], None] | None = None,
+    on_status: Callable[[str, int, int], None] | None = None,
 ) -> Translation:
     """Translate one PDF, reporting any segments the engine could not translate."""
     _require_core()
+    if ocr not in OCR_MODES:
+        raise TranslationError(f"Unsupported OCR mode: {ocr}")
     source = _validate_input(input_pdf)
     envs = _segment_envs(segments, emit_segments)
 
@@ -320,11 +435,57 @@ def translate_pdf(
                 "Pass --overwrite only with replacement authorization."
             )
 
+    if engine == "google":
+        from pdf2zh.translator import GOOGLE_BLOCK, RateLimitedError
+
+        # No OCR/model work while a known service cooldown is active.
+        try:
+            GOOGLE_BLOCK.check_available()
+        except RateLimitedError as error:
+            raise TranslationError(
+                "Google Translate is temporarily paused after a network refusal; "
+                "successful translations remain cached. Try again later."
+            ) from error
+    if on_status:
+        on_status("preparing", 0, 0)
+
     with tempfile.TemporaryDirectory(prefix="pdf-translate-", dir=destination_dir) as temp:
         temp_output = Path(temp)
+        processing_source = source
+        ocr_preparation = None
+        if ocr != "off":
+            try:
+                from pdf2zh.ocr import OcrUnavailableError, prepare_ocr_pdf
+
+                if on_status:
+                    on_status("ocr", 0, 0)
+                ocr_preparation = prepare_ocr_pdf(
+                    source,
+                    temp_output / f"{source.stem}-ocr-sidecar.pdf",
+                    mode=ocr,
+                    on_progress=(lambda done, total: on_status("ocr", done, total)) if on_status else None,
+                    pages=_pages_to_indices(pages),
+                    layout_model=_layout_model(os.environ.get("PDF_TRANSLATE_MODEL")),
+                )
+                processing_source = ocr_preparation.sidecar
+            except OcrUnavailableError as error:
+                requirements = SKILL_ROOT / "requirements-ocr.txt"
+                install = f'"{sys.executable}" -m pip install -r "{requirements}"'
+                raise TranslationError(f"OCR is unavailable: {error} Run: {install}") from error
+            except Exception as error:
+                raise TranslationError(f"OCR preparation failed: {_describe(error)}") from error
         try:
-            untranslated = _run_engine(
-                source,
+            engine_arguments = {}
+            if on_status:
+                on_status("translating", 0, 0)
+                engine_arguments["on_status"] = on_status
+            if ocr_preparation and ocr_preparation.pages:
+                engine_arguments["skip_backing_pages"] = set(ocr_preparation.pages)
+                engine_arguments["ocr_regions_by_page"] = (
+                    ocr_preparation.reflow_regions_by_page
+                )
+            report = _run_engine(
+                processing_source,
                 temp_output,
                 target_language,
                 source_language,
@@ -334,14 +495,45 @@ def translate_pdf(
                 engine,
                 envs,
                 on_progress,
+                **engine_arguments,
             )
         except TranslationError:
             raise
         except Exception as error:
             raise TranslationError(f"PDF translation core failed: {_describe(error)}") from error
 
+        # Nothing was translatable, so the engine produced a copy of the source
+        # with no translated text in it. Handing that over as a finished
+        # translation is the one outcome the preservation rules forbid outright:
+        # say what the document actually needs instead. The message carries the
+        # words app/errors.py matches for E-PDF-03.
+        if report.translatable_segments == 0:
+            if ocr != "off":
+                details = "; ".join(ocr_preparation.warnings) if ocr_preparation else ""
+                suffix = f" ({details})" if details else ""
+                raise TranslationError(
+                    f"OCR found no text that could be translated safely in {source.name}{suffix}"
+                )
+            raise TranslationError(
+                f"No text could be extracted from {source.name}: the selected pages are "
+                "image-only scans. OCR is off; translate the file again with OCR turned "
+                "on (--ocr standard)."
+            )
+
+        untranslated = len(report.failures)
+        image_only = tuple(sorted(report.image_only_pages))
+        ocr_pages = ocr_preparation.pages if ocr_preparation else ()
+        ocr_warnings = ocr_preparation.warnings if ocr_preparation else ()
         if destination is None:
-            return Translation(None, untranslated)
+            return Translation(
+                None,
+                untranslated,
+                report.reasons,
+                image_only,
+                ocr_pages,
+                ocr,
+                ocr_warnings,
+            )
 
         generated = temp_output / f"{source.stem}-mono.pdf"
         if not generated.is_file():
@@ -351,6 +543,24 @@ def translate_pdf(
                 raise TranslationError(f"Engine did not produce one translated PDF; found: {names}")
             generated = candidates[0]
 
+        if ocr_preparation and ocr_preparation.cleaned_images:
+            from pdf2zh.ocr import replace_ocr_page_images
+
+            cleaned_output = temp_output / f"{source.stem}-ocr-cleaned.pdf"
+            try:
+                replace_ocr_page_images(
+                    generated,
+                    cleaned_output,
+                    ocr_preparation.cleaned_images,
+                )
+            except Exception as error:
+                raise TranslationError(
+                    f"Could not install the cleaned OCR background: {_describe(error)}"
+                ) from error
+            generated = cleaned_output
+
+        if on_status:
+            on_status("saving", 0, 0)
         staged = destination_dir / f".{destination.name}.tmp"
         try:
             shutil.copyfile(generated, staged)
@@ -358,7 +568,15 @@ def translate_pdf(
         finally:
             staged.unlink(missing_ok=True)
 
-    return Translation(destination, untranslated)
+    return Translation(
+        destination,
+        untranslated,
+        report.reasons,
+        image_only,
+        ocr_pages,
+        ocr,
+        ocr_warnings,
+    )
 
 
 def _use_utf8_output() -> None:
@@ -389,18 +607,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             engine=args.engine,
             segments=args.segments,
             emit_segments=args.emit_segments,
+            ocr=args.ocr,
         )
     except TranslationError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     if result.path is not None:
         print(f"Translated PDF: {result.path}")
-    if result.untranslated:
+    if result.ocr_pages:
+        numbers = ", ".join(str(page + 1) for page in result.ocr_pages)
+        print(f"OCR ({result.ocr_profile}): pages {numbers}")
+    for warning in result.ocr_warnings:
+        print(f"warning: OCR {warning}", file=sys.stderr)
+    if result.image_only_pages:
+        numbers = ", ".join(str(page + 1) for page in result.image_only_pages)
         print(
-            f"warning: {result.untranslated} segments stayed in the source language "
-            "because the translation service could not be reached",
+            f"warning: page {numbers} is an image-only scan and was left untranslated; "
+            "this tool has no OCR"
+            if len(result.image_only_pages) == 1
+            else f"warning: pages {numbers} are image-only scans and were left "
+            "untranslated; this tool has no OCR",
             file=sys.stderr,
         )
+    for line in _describe_failures(result.reasons):
+        print(f"warning: {line}", file=sys.stderr)
     if args.emit_segments is not None:
         emitted = args.emit_segments.expanduser().resolve()
         pending = sum(1 for line in emitted.open(encoding="utf-8") if line.strip())

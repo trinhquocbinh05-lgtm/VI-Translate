@@ -1,20 +1,40 @@
 from __future__ import annotations
 
 import io
+import queue
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 try:
-    from app.gui import App, LANGUAGE_NAMES, collect_pdfs, ensure_writable_streams, main
+    from app.gui import (
+        App,
+        DEFAULT_OCR_MODE,
+        LANGUAGE_NAMES,
+        OCR_NAMES,
+        collect_pdfs,
+        ensure_writable_streams,
+        main,
+        verify_engine,
+        translation_outcome,
+    )
 except ImportError:  # customtkinter and tkinterdnd2 are app-only dependencies
     App = None
     collect_pdfs = None
     main = None
+    verify_engine = None
 
+from app.update import (
+    REQUIRED_PAYLOAD,
+    STAGED_MARKER,
+    Release,
+    staged_payload,
+    staging_directory,
+)
 from scripts.translate_pdf import TARGET_LANGUAGES
 
 
@@ -61,6 +81,85 @@ class LanguageMenuTests(unittest.TestCase):
 
     def test_menu_labels_are_unique_so_the_reverse_lookup_is_total(self):
         self.assertEqual(len(set(LANGUAGE_NAMES.values())), len(LANGUAGE_NAMES))
+
+    def test_every_ocr_mode_has_a_unique_menu_label(self):
+        from scripts.translate_pdf import OCR_MODES
+
+        self.assertEqual(set(OCR_NAMES), set(OCR_MODES))
+        self.assertEqual(len(set(OCR_NAMES.values())), len(OCR_NAMES))
+
+    def test_ocr_stays_off_until_the_user_turns_it_on(self):
+        """A scanned book read by OCR is thousands of Google requests, and slow."""
+        self.assertEqual(DEFAULT_OCR_MODE, "off")
+        self.assertIn(DEFAULT_OCR_MODE, OCR_NAMES)
+
+
+@unittest.skipIf(App is None, "desktop app dependencies are not installed")
+class TranslationOutcomeTests(unittest.TestCase):
+    @staticmethod
+    def result(**overrides):
+        values = {
+            "untranslated": 0,
+            "reasons": {},
+            "image_only_pages": (),
+            "ocr_warnings": (),
+        }
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def test_clean_ocr_result_is_done(self):
+        self.assertEqual(translation_outcome(self.result()), ("done", ""))
+
+    def test_a_blocked_network_is_named_so_the_user_waits_instead_of_retrying(self):
+        state, detail = translation_outcome(
+            self.result(untranslated=40, reasons={"RateLimitedError": 38, "ConnectionError": 2})
+        )
+        self.assertEqual(state, "partial")
+        self.assertIn("40 đoạn chưa dịch được", detail)
+        self.assertIn("Google tạm chặn", detail)
+        self.assertNotIn("kiểm tra mạng", detail)
+
+    def test_a_dead_connection_is_told_apart_from_a_block(self):
+        _, detail = translation_outcome(
+            self.result(untranslated=3, reasons={"ServiceUnavailableError": 3})
+        )
+        self.assertIn("kiểm tra mạng", detail)
+        self.assertNotIn("Google tạm chặn", detail)
+
+    def test_a_segment_that_did_not_fit_gets_no_network_advice(self):
+        _, detail = translation_outcome(
+            self.result(untranslated=1, reasons={"single line needs less than 50% font size": 1})
+        )
+        self.assertEqual(detail, "1 đoạn chưa dịch được")
+
+    def test_preserved_scan_is_never_reported_as_done(self):
+        state, detail = translation_outcome(self.result(image_only_pages=(0, 4)))
+        self.assertEqual(state, "partial")
+        self.assertIn("1, 5", detail)
+
+    def test_ocr_safety_warning_is_visible_as_partial(self):
+        state, detail = translation_outcome(
+            self.result(ocr_warnings=("page 2: preserved (form grid)",))
+        )
+        self.assertEqual(state, "partial")
+        self.assertIn("OCR", detail)
+
+    def test_worker_passes_selected_ocr_mode_and_reports_safety_partial(self):
+        source = Path("scan.pdf")
+        result = types.SimpleNamespace(
+            path=Path("translated/scan-vi.pdf"), untranslated=0, reasons={},
+            image_only_pages=(), ocr_warnings=("page 1: preserved (form grid)",),
+        )
+        app = types.SimpleNamespace(events=queue.Queue(), failures={})
+        with mock.patch("app.gui.translate_pdf", return_value=result) as translate:
+            App._run(app, [source], "vi", False, "standard")
+        self.assertEqual(translate.call_args.kwargs["ocr"], "standard")
+        events = []
+        while not app.events.empty():
+            events.append(app.events.get_nowait())
+        status = next(event for event in events if event[0] == "status" and event[2] != "running")
+        self.assertEqual(status[2], "partial")
+        self.assertIn("OCR", status[3])
 
 
 @unittest.skipIf(collect_pdfs is None, "desktop app dependencies are not installed")
@@ -112,6 +211,137 @@ class OpenResultTests(unittest.TestCase):
         )
 
 
+@unittest.skipIf(App is None, "desktop app dependencies are not installed")
+class UpdateFlowTests(unittest.TestCase):
+    """What the update thread decides, driven through App's own method.
+
+    Constructing App needs a real window; the flow it runs on a daemon thread
+    needs only an event queue, so it is given one and nothing else.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.install = Path(self.temp.name) / "PDFTranslate"
+        self.install.mkdir()
+        self.app = types.SimpleNamespace(events=queue.Queue(), update_percent=-1)
+        self.app._report_download = lambda *_arguments: None
+        self.release = Release("v9.0.0", "https://example/windows.zip", 1024)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _stage_payload(self, tag: str) -> None:
+        payload = staged_payload(self.install)
+        payload.mkdir(parents=True, exist_ok=True)
+        for name in REQUIRED_PAYLOAD:
+            (payload / name).parent.mkdir(parents=True, exist_ok=True)
+            (payload / name).write_bytes(b"payload")
+        (staging_directory(self.install) / STAGED_MARKER).write_text(tag, encoding="utf-8")
+
+    def _run(self, **patches):
+        with mock.patch("app.gui.install_directory", return_value=self.install), \
+             mock.patch("app.gui.can_self_update", return_value=True), \
+             mock.patch.multiple("app.gui", **patches):
+            App._check_for_update(self.app)
+        events = []
+        while not self.app.events.empty():
+            events.append(self.app.events.get_nowait())
+        return events
+
+    def test_a_build_that_cannot_swap_itself_only_gets_the_link(self):
+        """Running from source, or on a Mac: there is no folder to replace."""
+        with mock.patch("app.gui.install_directory", return_value=None), \
+             mock.patch("app.gui.check_for_update", return_value="v9.0.0"):
+            App._check_for_update(self.app)
+        self.assertEqual(self.app.events.get_nowait(), ("update", "v9.0.0"))
+
+    def test_a_build_staged_earlier_is_offered_without_downloading_again(self):
+        self._stage_payload("v9.0.0")
+        network = mock.Mock()
+        events = self._run(latest_release=network)
+        self.assertEqual(events, [("update_ready", "v9.0.0")])
+        network.assert_not_called()
+
+    def test_a_release_with_no_windows_asset_falls_back_to_the_link(self):
+        events = self._run(latest_release=mock.Mock(return_value=Release("v9.0.0", "", 0)))
+        self.assertEqual(events, [("update", "v9.0.0")])
+
+    def test_a_disk_with_no_room_falls_back_to_the_link(self):
+        events = self._run(
+            latest_release=mock.Mock(return_value=self.release),
+            has_room_for=mock.Mock(return_value=False),
+        )
+        self.assertEqual(events, [("update", "v9.0.0")])
+
+    def test_a_staged_download_ends_in_the_restart_offer(self):
+        events = self._run(
+            latest_release=mock.Mock(return_value=self.release),
+            stage_update=mock.Mock(return_value=staged_payload(self.install)),
+        )
+        self.assertEqual(
+            events, [("update_downloading", "v9.0.0"), ("update_ready", "v9.0.0")]
+        )
+
+    def test_a_failed_download_leaves_the_link_and_no_staging(self):
+        self._stage_payload("v0.0.1")  # older than this build, so it is discarded
+        events = self._run(
+            latest_release=mock.Mock(return_value=self.release),
+            stage_update=mock.Mock(side_effect=OSError("connection reset")),
+        )
+        self.assertEqual(events, [("update_downloading", "v9.0.0"), ("update", "v9.0.0")])
+        self.assertFalse(staging_directory(self.install).exists())
+
+
+@unittest.skipIf(App is None, "desktop app dependencies are not installed")
+class InstallUpdateTests(unittest.TestCase):
+    def _app(self, translating: bool):
+        worker = mock.Mock()
+        worker.is_alive.return_value = translating
+        return types.SimpleNamespace(
+            worker=worker,
+            status=mock.Mock(),
+            update_tag="v9.0.0",
+            destroy=mock.Mock(),
+            _confirm_install=mock.Mock(return_value=True),
+            _show_update_link=mock.Mock(),
+        )
+
+    def test_a_running_batch_is_never_interrupted_by_a_restart(self):
+        app = self._app(translating=True)
+        with mock.patch("app.gui.launch_updater") as launch:
+            App._install_update(app)
+        launch.assert_not_called()
+        app.destroy.assert_not_called()
+        app.status.configure.assert_called_once()
+
+    def test_declining_the_dialog_changes_nothing(self):
+        app = self._app(translating=False)
+        app._confirm_install.return_value = False
+        with mock.patch("app.gui.install_directory", return_value=Path("C:/app")), \
+             mock.patch("app.gui.launch_updater") as launch:
+            App._install_update(app)
+        launch.assert_not_called()
+        app.destroy.assert_not_called()
+
+    def test_accepting_starts_the_helper_and_closes_the_app(self):
+        app = self._app(translating=False)
+        install = Path("C:/app/PDFTranslate")
+        with mock.patch("app.gui.install_directory", return_value=install), \
+             mock.patch("app.gui.launch_updater") as launch:
+            App._install_update(app)
+        launch.assert_called_once_with(install)
+        app.destroy.assert_called_once_with()
+
+    def test_a_helper_that_will_not_start_leaves_a_working_app(self):
+        app = self._app(translating=False)
+        with mock.patch("app.gui.install_directory", return_value=Path("C:/app")), \
+             mock.patch("app.gui.launch_updater", side_effect=OSError("blocked")):
+            App._install_update(app)
+        app.destroy.assert_not_called()
+        app._show_update_link.assert_called_once()
+        self.assertEqual(app._show_update_link.call_args.args[1], "browser")
+
+
 @unittest.skipIf(main is None, "desktop app dependencies are not installed")
 class PackagedSmokeTestTests(unittest.TestCase):
     def test_smoke_test_loads_and_closes_the_app_without_entering_mainloop(self):
@@ -123,13 +353,55 @@ class PackagedSmokeTestTests(unittest.TestCase):
             mock.patch("app.gui.ctk.set_appearance_mode"),
             mock.patch("app.gui.ctk.set_default_color_theme"),
             mock.patch("app.gui.App", return_value=fake_app),
+            mock.patch("app.gui.verify_engine") as verify,
         ):
             main()
 
         fake_app.withdraw.assert_called_once_with()
         fake_app.update_idletasks.assert_called_once_with()
+        verify.assert_called_once_with()
         fake_app.destroy.assert_called_once_with()
         fake_app.mainloop.assert_not_called()
+
+    def test_the_smoke_test_exits_nonzero_when_the_native_stack_is_broken(self):
+        """A packaged build that cannot load pikepdf or onnx must not exit 0.
+
+        It must also exit rather than raise: a windowed build turns an escaping
+        exception into a modal traceback dialog, which on a build machine hangs
+        the job instead of failing it.
+        """
+        fake_app = mock.Mock()
+        with (
+            mock.patch("app.gui.sys.argv", ["PDFTranslate", "--smoke-test"]),
+            mock.patch("app.gui.ensure_writable_streams"),
+            mock.patch("app.gui.use_bundled_assets"),
+            mock.patch("app.gui.ctk.set_appearance_mode"),
+            mock.patch("app.gui.ctk.set_default_color_theme"),
+            mock.patch("app.gui.App", return_value=fake_app),
+            mock.patch("app.gui.verify_engine", side_effect=ImportError("no qpdf")),
+        ):
+            with self.assertRaises(SystemExit) as exit_status:
+                main()
+
+        self.assertEqual(exit_status.exception.code, 1)
+        fake_app.destroy.assert_called_once_with()
+        fake_app.mainloop.assert_not_called()
+
+    def test_verify_engine_loads_the_real_native_stack(self):
+        """Not mocked: this is the check itself, run against this environment.
+
+        Building the session fills a process-wide cache that other tests expect
+        to be cold so they can substitute their own model, so it is put back
+        exactly as it was found.
+        """
+        from scripts import translate_pdf
+
+        cached = dict(translate_pdf._LAYOUT_MODEL)
+        try:
+            verify_engine()
+        finally:
+            translate_pdf._LAYOUT_MODEL.clear()
+            translate_pdf._LAYOUT_MODEL.update(cached)
 
 
 if __name__ == "__main__":

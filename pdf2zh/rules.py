@@ -49,6 +49,12 @@ LANGUAGE_LINE_HEIGHT = {
     "vi": 1.2,
 }
 
+# Measured ink extents, not preferences: see min_line_height_for_language.
+DEFAULT_MIN_LINE_HEIGHT = 0.95
+LANGUAGE_MIN_LINE_HEIGHT = {
+    "vi": 1.10,
+}
+
 
 @dataclass(frozen=True)
 class PreservationDecision:
@@ -90,6 +96,24 @@ def is_bullet_character(text: str, font_name: str | bytes = "") -> bool:
 def line_height_for_language(language: str) -> float:
     """Return the translation line-height multiplier for a target language."""
     return LANGUAGE_LINE_HEIGHT.get(language.lower(), 1.1)
+
+
+def min_line_height_for_language(language: str) -> float:
+    """Return the tightest leading that still keeps two lines from touching.
+
+    A paragraph that grew in translation used to buy room by crushing its
+    leading to 0.75, which is below the ink of the glyphs being drawn. Measured
+    by rendering every letter in the output font and reading the real ink
+    extent, in em above and below the baseline:
+
+        English lowercase   0.695 up + 0.210 down = 0.905
+        Vietnamese          0.890 up + 0.210 down = 1.100
+
+    Stacked tone marks (e-circumflex-acute, o-horn-grave) reach far higher than
+    a plain ascender, so Vietnamese needs more room than English rather than
+    less. Below these values the lines overlap no matter what else is right.
+    """
+    return LANGUAGE_MIN_LINE_HEIGHT.get(language.lower(), DEFAULT_MIN_LINE_HEIGHT)
 
 
 def _rect(value: Sequence[Any]) -> tuple[float, float, float, float] | None:
@@ -242,6 +266,143 @@ def matching_table_cells(
     return cells
 
 
+def text_aligned_table_cells(
+    model_bounds: Sequence[Any],
+    words: Iterable[Sequence[Any]],
+    rules: Iterable[Sequence[Any]] = (),
+) -> list[tuple[float, float, float, float]]:
+    """Cells of a table set without a grid, found from how its text is aligned.
+
+    PyMuPDF finds cells from ruling lines, so a table with only a rule under
+    its header - every table in the Combatting infectious diarrhea review -
+    yields none and stayed in English. Its columns are still plain to see: a
+    band of white space runs the table's full height between them. Inside a
+    column a cell ends where the space between lines grows, a rule crosses, a
+    bullet opens an item, or the left edge moves (a record's name set out, its
+    details set in). Each cell reaches down to the next cell of its column, so
+    a longer translation has the white space below its source text and never
+    more. A table that does not divide this way returns no cells and stays
+    protected, as before.
+    """
+    model = _rect(model_bounds)
+    if model is None:
+        return []
+    mx0, my0, mx1, my1 = model
+    items = []
+    for word in words:
+        bounds = _rect(word)
+        if bounds is None or len(word) < 5 or not str(word[4]).strip():
+            continue
+        x0, y0, x1, y1 = bounds
+        if mx0 <= (x0 + x1) / 2 <= mx1 and my0 <= (y0 + y1) / 2 <= my1:
+            items.append((x0, y0, x1, y1, str(word[4])))
+    if len(items) < 4:
+        return []
+    height = median(item[3] - item[1] for item in items)
+
+    rows: list[list[tuple[float, float, float, float, str]]] = []
+    for item in sorted(items, key=lambda item: ((item[1] + item[3]) / 2, item[0])):
+        if rows and abs((item[1] + item[3]) / 2 - (rows[-1][0][1] + rows[-1][0][3]) / 2) <= height * 0.5:
+            rows[-1].append(item)
+        else:
+            rows.append([item])
+    # A gutter must be wider than the space between words, which justified
+    # cells stretch, so it is measured against the spaces this table uses.
+    spaces = [
+        current[0] - previous[2]
+        for row in rows
+        for previous, current in zip(sorted(row), sorted(row)[1:])
+        if current[0] > previous[2]
+    ]
+    gutter = max(3.0, height * 0.4, 2.0 * median(spaces) if spaces else 0.0)
+
+    columns: list[list[float]] = []
+    for x0, _y0, x1, _y1, _text in sorted(items):
+        if columns and x0 < columns[-1][1] + gutter:
+            columns[-1][1] = max(columns[-1][1], x1)
+        else:
+            columns.append([x0, x1])
+    # A real column holds text on more than one row. A lone gap inside a
+    # centred heading is not a column, so it joins the column beside it.
+    merged = True
+    while merged and len(columns) > 1:
+        merged = False
+        for index, (left, right) in enumerate(columns):
+            populated = sum(
+                any(left <= (item[0] + item[2]) / 2 <= right for item in row) for row in rows
+            )
+            if populated < 2:
+                neighbour = index - 1 if index else index + 1
+                columns[neighbour] = [
+                    min(columns[neighbour][0], left), max(columns[neighbour][1], right)
+                ]
+                del columns[index]
+                merged = True
+                break
+    if not 2 <= len(columns) <= 12:
+        return []
+
+    horizontal_rules = []
+    for rule in rules:
+        bounds = _rect(rule)
+        if bounds is not None and bounds[3] - bounds[1] <= 2.0:
+            horizontal_rules.append(bounds)
+
+    cells: list[tuple[float, float, float, float]] = []
+    for index, (left, right) in enumerate(columns):
+        members = sorted(
+            (item for item in items if left <= (item[0] + item[2]) / 2 <= right),
+            key=lambda item: (item[1], item[0]),
+        )
+        lines: list[list[tuple[float, float, float, float, str]]] = []
+        for item in members:
+            if lines:
+                top = min(word[1] for word in lines[-1])
+                bottom = max(word[3] for word in lines[-1])
+                if top <= (item[1] + item[3]) / 2 <= bottom:
+                    lines[-1].append(item)
+                    continue
+            lines.append([item])
+
+        blocks: list[list[list[tuple[float, float, float, float, str]]]] = []
+        for line in lines:
+            line.sort()
+            if blocks:
+                previous = blocks[-1][-1]
+                previous_bottom = max(word[3] for word in previous)
+                top = min(word[1] for word in line)
+                crossed = any(
+                    previous_bottom - 0.5 <= (rule[1] + rule[3]) / 2 <= top + 0.5
+                    and rule[0] < right and rule[2] > left
+                    for rule in horizontal_rules
+                )
+                if not (
+                    top - previous_bottom > height * 0.5
+                    or crossed
+                    or abs(line[0][0] - previous[0][0]) > max(1.5, height * 0.2)
+                    or line[0][4][:1] in BULLET_CHARACTERS
+                ):
+                    blocks[-1].append(line)
+                    continue
+            blocks.append([line])
+
+        right_edge = columns[index + 1][0] - 2.0 if index + 1 < len(columns) else mx1
+        for position, block in enumerate(blocks):
+            block_words = [word for line in block for word in line]
+            x0 = min(word[0] for word in block_words) - 2.0
+            y0 = min(word[1] for word in block_words)
+            y1 = max(word[3] for word in block_words)
+            limit = my1
+            if position + 1 < len(blocks):
+                limit = min(word[1] for word in blocks[position + 1][0]) - 1.0
+            for rule in horizontal_rules:
+                middle = (rule[1] + rule[3]) / 2
+                if y1 <= middle < limit and rule[0] < right_edge and rule[2] > x0:
+                    limit = middle - 0.5
+            cells.append((x0, y0, max(right_edge, x0 + 1.0), max(y1, limit)))
+    return cells if len(cells) >= 2 else []
+
+
 def should_translate_table_cell(text: str) -> bool:
     """Return whether a cell contains natural-language text rather than codes.
 
@@ -357,6 +518,18 @@ def cluster_table_words(
             )
         )
     return result
+
+
+def page_has_image(blocks: Iterable[Mapping[str, Any]]) -> bool:
+    """Return whether the page draws any raster image at all.
+
+    is_scanned_page asks whether one image covers half the page, which is the
+    right question for backing rectangles but the wrong one for deciding a page
+    held nothing to translate: scanners routinely emit a page as dozens of
+    tiles, none of them large on its own. A page with no text and no image is
+    simply blank, and saying so would be noise.
+    """
+    return any(block.get("type") == 1 for block in blocks)
 
 
 def is_scanned_page(blocks: Iterable[Mapping[str, Any]], page_area: float) -> bool:

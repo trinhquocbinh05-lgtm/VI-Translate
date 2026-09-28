@@ -3,11 +3,16 @@
 import asyncio
 import io
 import logging
+import math
 import os
 import re
 import sys
 import tempfile
 from asyncio import CancelledError
+from contextlib import closing
+from collections import Counter
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 from typing import Any, BinaryIO, Dict, List, Optional
@@ -32,8 +37,30 @@ from pdf2zh.rules import (
     formula_regions,
     is_scanned_page,
     matching_table_cells,
+    page_has_image,
     should_translate_table_cell,
+    text_aligned_table_cells,
 )
+
+@dataclass(frozen=True)
+class TranslationReport:
+    """What a run could not translate, and why.
+
+    The count on its own was ambiguous: a page of diagrams, a document that is
+    all scans, and a dropped connection all arrived as the same number, and the
+    caller had to guess. Each of those needs the user to do something
+    different, so the reasons travel with the count.
+    """
+
+    failures: list[str] = field(default_factory=list)
+    reasons: Counter = field(default_factory=Counter)
+    image_only_pages: set[int] = field(default_factory=set)
+    translatable_segments: int = 0
+    pages_processed: int = 0
+
+    def __len__(self) -> int:
+        return len(self.failures)
+
 
 NOTO_NAME = "noto"
 STYLE_FONT_NAMES = {
@@ -59,8 +86,16 @@ def is_large_document(page_count: int, source_size: int = 0) -> bool:
 def should_subset_fonts(
     page_count: int, skip_subset_fonts: bool, source_size: int = 0
 ) -> bool:
-    """Avoid the blocking whole-document font scan on large PDFs."""
-    return not skip_subset_fonts and not is_large_document(page_count, source_size)
+    """Never subset: the converter writes raw glyph IDs into Identity-H fonts.
+
+    `raw_string()` emits `font.has_glyph(ord(c))` as the CID, so any pass that
+    renumbers glyphs repoints every translated character at a different
+    outline. It cost Vietnamese every stacked-diacritic letter ("Viet Nam"
+    where "Viet" needed U+1EC7) on documents small enough to fall under the old
+    page/size threshold. The parameters are kept so the call site still reads
+    as a decision rather than a silent omission.
+    """
+    return False
 
 
 def pdf_write_options(page_count: int, source_size: int = 0) -> dict[str, int | bool]:
@@ -120,6 +155,111 @@ noto_list = [
 ]
 
 
+def pymupdf_can_round_trip(path: Path) -> bool:
+    """Report whether the engine can both read and rewrite this document.
+
+    pikepdf tolerates structural damage that MuPDF later refuses on write, so
+    probing with pikepdf let a malformed 517-page book reach `translate_stream`
+    and die there with "invalid key in dict". The engine's own round trip is
+    the only probe that predicts the failure it is meant to prevent, and it
+    costs under a second even on a 48 MB book.
+    """
+    document = None
+    try:
+        document = Document(str(path))
+        document.save(io.BytesIO())
+    except Exception:
+        return False
+    finally:
+        if document is not None:
+            try:
+                document.close()
+            except Exception:
+                pass  # a document that failed to save also fails to close
+    return True
+
+
+def horizontal_rules(page: Document) -> list[tuple[float, float, float, float]]:
+    """Thin horizontal strokes and bars drawn on a page, in text coordinates."""
+    rules = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:  # noqa: BLE001 - no rules only means less evidence of rows
+        return rules
+    for drawing in drawings:
+        for item in drawing.get("items", ()):
+            if item[0] == "l":
+                start, end = item[1], item[2]
+                if abs(start.y - end.y) <= 0.5 and abs(start.x - end.x) >= 5:
+                    rules.append((min(start.x, end.x), start.y, max(start.x, end.x), end.y))
+            elif item[0] == "re":
+                rect = item[1]
+                if rect.height <= 2.0 and rect.width >= 5:
+                    rules.append((rect.x0, rect.y0, rect.x1, rect.y1))
+    return rules
+
+
+def span_sizes(page: Document) -> list[tuple[float, float, float, float, float]]:
+    """Each text span's box and font size."""
+    sizes = []
+    for block in page.get_text("dict").get("blocks", ()):
+        for line in block.get("lines", ()):
+            for span in line.get("spans", ()):
+                if span.get("text", "").strip():
+                    sizes.append((*span["bbox"], float(span["size"])))
+    return sizes
+
+
+def mixes_text_sizes(
+    bounds: tuple[float, float, float, float],
+    spans: list[tuple[float, float, float, float, float]],
+) -> bool:
+    """Whether text inside the bounds is set in noticeably different sizes."""
+    x0, y0, x1, y1 = bounds
+    inside = [
+        size
+        for sx0, sy0, sx1, sy1, size in spans
+        if x0 <= (sx0 + sx1) / 2 <= x1 and y0 <= (sy0 + sy1) / 2 <= y1
+    ]
+    return bool(inside) and max(inside) > min(inside) * 1.15
+
+
+def apply_ocr_region_ownership(
+    layout: np.ndarray,
+    class_bounds: dict[int, tuple[float, float, float, float]],
+    regions: Iterable[object],
+    next_class: int,
+    line_bounds: dict | None = None,
+) -> int:
+    """Pin OCR line boxes to the exact layout region that approved them."""
+    height, width = layout.shape
+    for region in regions:
+        bounds = tuple(float(value) for value in region.bbox)
+        if len(bounds) != 4 or bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+            continue
+        painted = False
+        for line_box in region.line_boxes:
+            x0, y0, x1, y1 = (float(value) for value in line_box)
+            bx0 = int(np.clip(math.floor(x0 - 1), 0, width - 1))
+            by0 = int(np.clip(math.floor(y0 - 1), 0, height - 1))
+            bx1 = int(np.clip(math.ceil(x1 + 1), 0, width))
+            by1 = int(np.clip(math.ceil(y1 + 1), 0, height))
+            if bx1 <= bx0 or by1 <= by0:
+                continue
+            target = layout[by0:by1, bx0:bx1]
+            # A second layout pass may find a protected structure that the
+            # OCR-resolution pass missed. Ownership never overrides it.
+            writable = target != 0
+            target[writable] = next_class
+            painted = painted or bool(writable.any())
+        if painted:
+            class_bounds[next_class] = bounds
+            if line_bounds is not None:
+                line_bounds[next_class] = bounds
+            next_class += 1
+    return next_class
+
+
 def check_files(files: List[str]) -> List[str]:
     files = [
         f for f in files if not f.startswith("http://")
@@ -152,12 +292,23 @@ def translate_patch(
     style_font_names: Dict | None = None,
     style_fonts: Dict | None = None,
     synthetic_styles: set[int] | None = None,
+    skip_backing_pages: set[int] | None = None,
+    ocr_regions_by_page: Dict | None = None,
+    on_status: Callable[[str, int, int], None] | None = None,
     **kwarg: Any,
 ) -> None:
     rsrcmgr = PDFResourceManager()
     layout = {}
     layout_bounds = {}
+    # The full extent of each ordinary text region, kept apart from
+    # layout_bounds because that one marks a table cell and changes how a
+    # paragraph is fitted. This is only a measure to compare line ends against.
+    class_bounds = {}
+    ocr_paragraph_classes = {}
     scanned_pages = set()
+    skip_backing_pages = skip_backing_pages or set()
+    ocr_regions_by_page = ocr_regions_by_page or {}
+    pages_with_images = set()
     device = TranslateConverter(
         rsrcmgr,
         vfont,
@@ -176,8 +327,12 @@ def translate_patch(
         style_font_names,
         style_fonts,
         synthetic_styles,
+        class_bounds,
+        ocr_paragraph_classes,
     )
 
+    if hasattr(device.translator, "on_status"):
+        device.translator.on_status = on_status
     assert device is not None
     obj_patch = {}
     interpreter = PDFPageInterpreterEx(rsrcmgr, device, obj_patch)
@@ -188,21 +343,24 @@ def translate_patch(
 
     parser = PDFParser(inf)
     doc = PDFDocument(parser)
-    with tqdm.tqdm(total=total_pages) as progress:
+    with closing(device), tqdm.tqdm(total=total_pages) as progress:
         for pageno, page in enumerate(PDFPage.create_pages(doc)):
             if cancellation_event and cancellation_event.is_set():
                 raise CancelledError("task cancelled")
             if pages and (pageno not in pages):
                 continue
-            progress.update()
             if callback:
                 callback(progress)
+            if on_status:
+                on_status("layout", pageno + 1, doc_zh.page_count)
             page.pageno = pageno
             page_rect = doc_zh[page.pageno].rect
             page_area = page_rect.width * page_rect.height
             page_blocks = doc_zh[page.pageno].get_text("dict")["blocks"]
-            if is_scanned_page(page_blocks, page_area):
+            if is_scanned_page(page_blocks, page_area) and pageno not in skip_backing_pages:
                 scanned_pages.add(pageno)
+            if page_has_image(page_blocks):
+                pages_with_images.add(pageno)
             pix = doc_zh[page.pageno].get_pixmap()
             image = np.frombuffer(pix.samples, np.uint8).reshape(
                 pix.height, pix.width, 3
@@ -218,8 +376,15 @@ def translate_patch(
                 (i, d) for i, d in enumerate(page_layout.boxes)
                 if page_layout.names[int(d.cls)] not in vcls
             ]
+            page_class_bounds = class_bounds.setdefault(page.pageno, {})
             for i, d in reversed(non_vcls_boxes):
                 x0, y0, x1, y1 = d.xyxy.squeeze()
+                page_class_bounds[i + 2] = (
+                    float(x0),
+                    float(page_rect.height) - float(y1),
+                    float(x1),
+                    float(page_rect.height) - float(y0),
+                )
                 x0, y0, x1, y1 = (
                     np.clip(int(x0 - 1), 0, w - 1),
                     np.clip(int(h - y1 - 1), 0, h - 1),
@@ -264,8 +429,21 @@ def translate_patch(
             page_bounds = layout_bounds.setdefault(page.pageno, {})
             page_height = float(page_rect.height)
             page_words = source_page.get_text("words", sort=True)
+            page_rules = None
+            page_span_sizes = None
             for table_bounds in model_table_bounds:
-                for cell in matching_table_cells(table_bounds, detected_tables):
+                cells = matching_table_cells(table_bounds, detected_tables)
+                aligned = False
+                if not cells:
+                    # No grid to read cells from; the text alignment may still
+                    # divide the table cleanly, or return nothing and keep it.
+                    if page_rules is None:
+                        page_rules = horizontal_rules(source_page)
+                    cells = text_aligned_table_cells(table_bounds, page_words, page_rules)
+                    aligned = bool(cells)
+                    if aligned and page_span_sizes is None:
+                        page_span_sizes = span_sizes(source_page)
+                for cell in cells:
                     cx0 = max(float(cell[0]), table_bounds[0])
                     cy0 = max(float(cell[1]), table_bounds[1])
                     cx1 = min(float(cell[2]), table_bounds[2])
@@ -282,6 +460,12 @@ def translate_patch(
                         cell_words, (cx0, cy0, cx1, cy1)
                     ):
                         if not should_translate_table_cell(cluster.text):
+                            continue
+                        # A gridless table was never translated before, and a
+                        # cell such as "dA dimensioned at 200 mm" holds a
+                        # subscripted variable the reflow printed small and
+                        # raised. Mixed sizes keep such a cell as it was.
+                        if aligned and mixes_text_sizes(cluster.bbox, page_span_sizes):
                             continue
                         for word in cluster.words:
                             wx0, wy0, wx1, wy1 = (
@@ -441,17 +625,51 @@ def translate_patch(
                 )
                 box[:, :] = 0
 
+            if box.any() and pageno in ocr_regions_by_page:
+                first_ocr_class = next_class
+                next_class = apply_ocr_region_ownership(
+                    box,
+                    page_class_bounds,
+                    ocr_regions_by_page[pageno],
+                    next_class,
+                    layout_bounds.setdefault(pageno, {}),
+                )
+                ocr_paragraph_classes[pageno] = set(range(first_ocr_class, next_class))
+
             layout[page.pageno] = box
+            # A page classified as wholly protected has nothing to translate.
+            # Leave its original content stream intact instead of decomposing
+            # every glyph into new operators. That replay is unnecessary and
+            # changes the effective orientation on pages with /Rotate 90.
+            if not box.any():
+                if pageno in scanned_pages:
+                    device.scanned_pages.add(pageno)
+                if pageno in pages_with_images:
+                    device.pages_with_images.add(pageno)
+                progress.update()
+                if callback:
+                    callback(progress)
+                continue
             if pageno in scanned_pages:
                 device.scanned_pages.add(pageno)
+            if pageno in pages_with_images:
+                device.pages_with_images.add(pageno)
             page.page_xref = doc_zh.get_new_xref()
             doc_zh.update_object(page.page_xref, "<<>>")
             doc_zh.update_stream(page.page_xref, b"")
             doc_zh[page.pageno].set_contents(page.page_xref)
             interpreter.process_page(page)
+            progress.update()
+            if callback:
+                callback(progress)
 
-    device.close()
-    return obj_patch, device.translation_failures
+    return obj_patch, TranslationReport(
+        failures=device.translation_failures,
+        reasons=device.failure_reasons,
+        image_only_pages=device.image_only_pages,
+        translatable_segments=device.translatable_segments,
+        pages_processed=total_pages,
+    )
 
 
 def translate_stream(
@@ -471,6 +689,9 @@ def translate_stream(
     skip_subset_fonts: bool = False,
     create_dual: bool = True,
     ignore_cache: bool = False,
+    skip_backing_pages: set[int] | None = None,
+    ocr_regions_by_page: Dict | None = None,
+    on_status: Callable[[str, int, int], None] | None = None,
     **kwarg: Any,
 ):
     source_size = len(stream)
@@ -531,7 +752,13 @@ def translate_stream(
     fp = io.BytesIO()
 
     doc_zh.save(fp)
-    obj_patch, translation_failures = translate_patch(fp, **locals())
+    try:
+        obj_patch, report = translate_patch(fp, **locals())
+    except BaseException:
+        doc_zh.close()
+        if not doc_en.is_closed:
+            doc_en.close()
+        raise
 
     for obj_id, ops_new in obj_patch.items():
         # ops_old=doc_en.xref_stream(obj_id)
@@ -545,15 +772,15 @@ def translate_stream(
         for id in range(page_count):
             doc_en.move_page(page_count + id, id * 2 + 1)
 
-    # PyMuPDF's whole-document font scan is disproportionately expensive for
-    # textbooks and holds the GIL while it runs.  The output fonts are already
-    # embedded and valid without subsetting, so favour a responsive, reliable
-    # export for large documents over shaving a few megabytes from the result.
-    subset_fonts = should_subset_fonts(page_count, skip_subset_fonts, source_size)
-    if subset_fonts:
+    # Off for every document; see should_subset_fonts. It was also the
+    # expensive half of finalizing a textbook, so dropping it costs nothing but
+    # the size of the four embedded output faces.
+    if should_subset_fonts(page_count, skip_subset_fonts, source_size):
         doc_zh.subset_fonts(fallback=True)
         if create_dual:
             doc_en.subset_fonts(fallback=True)
+    if on_status:
+        on_status("saving", 0, 0)
     write_options = pdf_write_options(page_count, source_size)
     mono = doc_zh.write(**write_options)
     dual = (
@@ -561,10 +788,13 @@ def translate_stream(
         if create_dual
         else None
     )
+    doc_zh.close()
+    if not doc_en.is_closed:
+        doc_en.close()
     return (
         mono,
         dual,
-        translation_failures,
+        report,
     )
 
 
@@ -635,6 +865,9 @@ def translate(
     prompt: Template = None,
     skip_subset_fonts: bool = False,
     ignore_cache: bool = False,
+    skip_backing_pages: set[int] | None = None,
+    ocr_regions_by_page: Dict | None = None,
+    on_status: Callable[[str, int, int], None] | None = None,
     **kwarg: Any,
 ):
     if not files:
@@ -658,9 +891,7 @@ def translate(
         processing_path = source_path
         temporary_paths: list[Path] = []
 
-        try:
-            pikepdf.open(source_path).close()
-        except Exception:
+        if not pymupdf_can_round_trip(source_path):
             logger.warning(
                 "PDF structure issue detected in %s; translating a repaired temporary copy",
                 source_path,
@@ -674,6 +905,13 @@ def translate(
                 temporary_paths.append(fixed_path)
             except Exception as error:
                 raise PDFValueError(f"Could not repair PDF structure: {source_path}") from error
+            if not pymupdf_can_round_trip(processing_path):
+                # Say so here rather than letting the same MuPDF syntax error
+                # resurface from deep inside the conversion, where it reads as
+                # an engine bug instead of an unreadable source document.
+                raise PDFValueError(
+                    f"PDF structure is damaged beyond repair: {source_path}"
+                )
 
         if compatible:
             with tempfile.NamedTemporaryFile(suffix="-pdfa.pdf", delete=False) as temporary:
@@ -687,23 +925,27 @@ def translate(
             temporary_path.unlink(missing_ok=True)
 
         try:
-            s_mono, _s_dual, translation_failures = translate_stream(
+            s_mono, _s_dual, report = translate_stream(
                 s_raw,
                 create_dual=False,
                 **locals(),
             )
-            if translation_failures:
+            if report.failures:
                 logger.warning(
                     "%d of the segments in %s could not be translated and were left "
-                    "in the source language",
-                    len(translation_failures),
+                    "in the source language (%s)",
+                    len(report.failures),
                     source_path,
+                    ", ".join(
+                        f"{reason} x{count}"
+                        for reason, count in report.reasons.most_common()
+                    ),
                 )
             file_mono = Path(output) / f"{filename}-mono.pdf"
             doc_mono = open(file_mono, "wb")
             doc_mono.write(s_mono)
             doc_mono.close()
-            result_files.append((str(file_mono), len(translation_failures)))
+            result_files.append((str(file_mono), report))
         except Exception as error:
             raise PDFValueError(f"Failed to translate {source_path}") from error
 

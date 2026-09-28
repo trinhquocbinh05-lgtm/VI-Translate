@@ -8,6 +8,7 @@ handoff engine is reachable from the skill rather than from here.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import queue
 import subprocess
@@ -16,6 +17,9 @@ import threading
 import tkinter
 import traceback
 import webbrowser
+from collections.abc import Iterator
+from contextlib import contextmanager
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from pathlib import Path
 
@@ -27,11 +31,27 @@ APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from app.update import APP_VERSION, RELEASES_PAGE, check_for_update  # noqa: E402
+from app.errors import Failure, describe_failure, report_text  # noqa: E402
+from app.update import (  # noqa: E402
+    APP_VERSION,
+    RELEASES_PAGE,
+    can_self_update,
+    check_for_update,
+    clean_previous_install,
+    discard_staging,
+    has_room_for,
+    install_directory,
+    is_newer,
+    latest_release,
+    launch_updater,
+    stage_update,
+    staged_version,
+)
 from scripts.translate_pdf import (  # noqa: E402
     DEFAULT_TARGET_LANGUAGE,
+    OCR_MODES,
     TARGET_LANGUAGES,
-    TranslationError,
+    load_layout_model,
     preload_layout_model,
     translate_pdf,
 )
@@ -64,7 +84,16 @@ LANGUAGE_NAMES = {
     "vi": "Tiếng Việt",
 }
 
-STATUS_MARKS = {"queued": "•", "running": "▶", "done": "✓", "partial": "!", "failed": "✕", "skipped": "–"}
+OCR_NAMES = {
+    "off": "Tắt OCR",
+    "standard": "Tự động",
+    "enhanced": "Nâng cao (chậm)",
+}
+# OCR is slow, and it turns every scanned page into text for Google: a scanned
+# book becomes thousands of segments. It runs only for someone who turns it on.
+DEFAULT_OCR_MODE = "off"
+
+STATUS_MARKS = {"queued": "•", "running": "▶", "done": "✓", "partial": "!", "failed": "✕", "skipped": "–", "paused": "Ⅱ"}
 STATUS_COLORS = {
     "queued": ("gray45", "gray60"),
     "running": ("#1f6feb", "#58a6ff"),
@@ -72,6 +101,7 @@ STATUS_COLORS = {
     "partial": ("#9a6700", "#d29922"),
     "failed": ("#cf222e", "#f85149"),
     "skipped": ("gray45", "gray60"),
+    "paused": ("#9a6700", "#d29922"),
 }
 ACCENT = STATUS_COLORS["running"]
 MUTED = ("gray45", "gray60")
@@ -157,6 +187,68 @@ def collect_pdfs(paths: list[Path]) -> list[Path]:
     return list(unique)
 
 
+# Named beside the count, because a block and a dead connection each ask the
+# user for something different, and neither is a fault in their document.
+SERVICE_FAILURE_ADVICE = {
+    "RateLimitedError": "Google tạm chặn yêu cầu từ kết nối này; "
+    "hiện chưa xác định được thời gian khôi phục, hãy thử lại sau",
+    "ServiceUnavailableError": "Google Dịch không phản hồi, hãy kiểm tra mạng rồi dịch lại",
+}
+
+
+@contextmanager
+def google_diagnostics(destination: Path) -> Iterator[None]:
+    """Bounded local counters only; never record request URLs or document text."""
+    logger = logging.getLogger("pdf2zh.translator")
+    handler = None
+    previous_level = logger.level
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            destination / "translation-service.log", maxBytes=262144,
+            backupCount=1, encoding="utf-8",
+        )
+        thread_id = threading.get_ident()
+        handler.addFilter(lambda record: record.thread == thread_id and
+                          record.msg == "Google translation counters: %s")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    except OSError:
+        if handler is not None:
+            handler.close()
+        handler = None
+    try:
+        yield
+    finally:
+        if handler is not None:
+            logger.removeHandler(handler)
+            handler.close()
+        logger.setLevel(previous_level)
+
+
+def translation_outcome(result) -> tuple[str, str]:
+    """Return the queue state and an honest, compact coverage summary."""
+    details = []
+    if result.untranslated:
+        summary = f"{result.untranslated} đoạn chưa dịch được"
+        causes = [
+            advice
+            for reason, advice in SERVICE_FAILURE_ADVICE.items()
+            if result.reasons.get(reason)
+        ]
+        if causes:
+            summary += f" ({'; '.join(causes)}; phần đã dịch được giữ lại cho lần sau)"
+        details.append(summary)
+    if result.image_only_pages:
+        pages = ", ".join(str(page + 1) for page in result.image_only_pages)
+        details.append(f"trang scan giữ nguyên: {pages}")
+    if result.ocr_warnings:
+        details.append(f"OCR giữ lại {len(result.ocr_warnings)} vùng/trang không an toàn")
+    partial = bool(details)
+    return ("partial" if partial else "done", "; ".join(details))
+
+
 class QueueRow:
     """The widgets for one queued file, kept together so the event drain can
     address the mark, the name and the detail column separately."""
@@ -179,11 +271,23 @@ class QueueRow:
         )
         self.name.grid(row=0, column=1, padx=PAD, pady=6, sticky="ew")
 
+        # Short, and only ever short: page counters and the like. A long error
+        # here used to expand this column until the filename column collapsed
+        # to nothing, so the row showed a clipped message and no file name.
         self.detail = ctk.CTkLabel(
-            self.frame, text="", anchor="e",
+            self.frame, text="", anchor="e", width=88,
             font=ctk.CTkFont(app.mono_font, size=11), text_color=MUTED,
         )
         self.detail.grid(row=0, column=2, pady=6, sticky="e")
+
+        # Anything long goes on its own line under the name, wrapped, where it
+        # can be read in full and clicked for the rest.
+        self.message = ctk.CTkLabel(
+            self.frame, text="", anchor="w", justify="left",
+            font=ctk.CTkFont(app.ui_font, size=11), text_color=MUTED,
+        )
+        self.message.grid(row=1, column=1, columnspan=2, padx=PAD, pady=(0, 6), sticky="ew")
+        self.message.grid_remove()
 
         self.remove = ctk.CTkButton(
             self.frame, text="✕", width=24, height=24, corner_radius=6,
@@ -194,7 +298,7 @@ class QueueRow:
         self.remove.grid(row=0, column=3, padx=(PAD // 2, PAD), pady=6)
 
         # Hover the whole row, not just the button, so it reads as one item.
-        for widget in (self.frame, self.mark, self.name, self.detail):
+        for widget in (self.frame, self.mark, self.name, self.detail, self.message):
             widget.bind("<Enter>", self._enter)
             widget.bind("<Leave>", self._leave)
 
@@ -204,10 +308,15 @@ class QueueRow:
     def _leave(self, _event) -> None:
         self.frame.configure(fg_color="transparent")
 
-    def set_state(self, state: str, detail: str) -> None:
+    def set_state(self, state: str, detail: str, message: str = "") -> None:
         self.mark.configure(text=STATUS_MARKS[state], text_color=STATUS_COLORS[state])
         self.name.configure(text_color=MUTED if state == "queued" else STATUS_COLORS[state])
         self.detail.configure(text=detail, text_color=STATUS_COLORS[state])
+        if message:
+            self.message.configure(text=message, text_color=STATUS_COLORS[state])
+            self.message.grid()
+        else:
+            self.message.grid_remove()
         if state != "queued":
             # Removing a file mid-batch would desync the worker's own list.
             self.remove.grid_remove()
@@ -240,6 +349,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.determinate = True
         self.last_output: Path | None = None
         self.outputs: dict[Path, Path] = {}
+        # Kept so a failed row can still show its full detail after the batch.
+        self.failures: dict[Path, tuple[Failure, Path | None]] = {}
+        # What the header link does right now: open the release page, restart
+        # into a downloaded build, or nothing while one is downloading.
+        self.update_action: str | None = None
+        self.update_tag = ""
+        self.update_percent = -1
 
         self._build()
         self.drop_target_register(DND_FILES)
@@ -306,7 +422,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             font=ctk.CTkFont(self.ui_font, size=12, weight="bold"),
         )
         self.update_link.grid(row=0, column=2, sticky="se")
-        self.update_link.bind("<Button-1>", lambda _event: webbrowser.open(RELEASES_PAGE))
+        self.update_link.bind("<Button-1>", lambda _event: self._on_update_link())
         self.update_link.grid_remove()
 
         ctk.CTkLabel(
@@ -387,18 +503,36 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.language.set(LANGUAGE_NAMES[DEFAULT_TARGET_LANGUAGE])
         self.language.grid(row=0, column=1, pady=(GAP, PAD), sticky="w")
 
+        ctk.CTkLabel(
+            controls, text="Trang ảnh scan", font=ctk.CTkFont(self.ui_font, size=13)
+        ).grid(row=1, column=0, padx=(GAP, PAD + 2), pady=(0, PAD), sticky="w")
+
+        self.ocr = ctk.CTkOptionMenu(
+            controls, values=[OCR_NAMES[mode] for mode in OCR_MODES],
+            width=200, height=34, font=ctk.CTkFont(self.ui_font, size=13),
+        )
+        self.ocr.set(OCR_NAMES[DEFAULT_OCR_MODE])
+        self.ocr.grid(row=1, column=1, pady=(0, PAD), sticky="w")
+
         self.translate_button = ctk.CTkButton(
             controls, text="Dịch", width=124, height=40, corner_radius=8,
             command=self._start, font=ctk.CTkFont(self.ui_font, size=14, weight="bold"),
         )
-        self.translate_button.grid(row=0, column=2, rowspan=2, padx=GAP, pady=GAP)
+        self.translate_button.grid(row=0, column=2, rowspan=4, padx=GAP, pady=GAP)
+
+        ctk.CTkLabel(
+            controls,
+            text="OCR thử nghiệm: bảng, công thức và hình không an toàn sẽ được giữ nguyên.",
+            anchor="w", justify="left", font=ctk.CTkFont(self.ui_font, size=11),
+            text_color=MUTED,
+        ).grid(row=2, column=0, columnspan=2, padx=GAP, pady=(0, PAD), sticky="w")
 
         self.overwrite = ctk.CTkCheckBox(
             controls, text="Ghi đè file đã dịch trước đó",
             checkbox_width=18, checkbox_height=18,
             font=ctk.CTkFont(self.ui_font, size=12),
         )
-        self.overwrite.grid(row=1, column=0, columnspan=2, padx=GAP, pady=(0, GAP), sticky="w")
+        self.overwrite.grid(row=3, column=0, columnspan=2, padx=GAP, pady=(0, GAP), sticky="w")
 
     def _build_queue(self) -> None:
         # A separate header, because CTkScrollableFrame's label_text cannot hold
@@ -437,6 +571,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         width = max(event.width - 160, 180)
         for row in self.rows.values():
             row.name.configure(wraplength=width)
+            row.message.configure(wraplength=width)
 
     def _build_footer(self) -> None:
         footer = ctk.CTkFrame(self, fg_color="transparent")
@@ -525,6 +660,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.files.remove(path)
         self.states.pop(path, None)
         self.outputs.pop(path, None)
+        self.failures.pop(path, None)
         for index, remaining in enumerate(self.files):
             self.rows[remaining].frame.grid_configure(row=index)
         self._refresh_queue_chrome()
@@ -538,6 +674,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.rows.clear()
         self.states.clear()
         self.outputs.clear()
+        self.failures.clear()
         self.last_output = None
         self.output_link.grid_remove()
         self.progress.grid_remove()
@@ -554,23 +691,140 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.status.configure(text=f"{count} file trong hàng đợi" if count else "Chưa có file nào")
         self._resize_dropzone()
 
-    # -- work --------------------------------------------------------------
+    # -- update ------------------------------------------------------------
     def _check_for_update(self) -> None:
-        """Runs on a daemon thread: the network must never delay the window."""
-        tag = check_for_update()
-        if tag:
-            self.events.put(("update", tag))
+        """Runs on a daemon thread: the network must never delay the window.
 
+        Downloading is deliberately not asked about - it is 193 MB in the
+        background of an app that is already downloading a translation model -
+        but restarting is, because a restart interrupts whatever the user came
+        here to do.
+        """
+        install = install_directory()
+        if install is None or not can_self_update(install):
+            # Running from source, or on a Mac, or installed somewhere this
+            # process may not rename folders. The release page is all we have.
+            tag = check_for_update()
+            if tag:
+                self.events.put(("update", tag))
+            return
+
+        clean_previous_install(install)
+        staged = staged_version(install)
+        if staged is not None and is_newer(staged, APP_VERSION):
+            # Downloaded on an earlier run and never restarted into.
+            self.events.put(("update_ready", staged))
+            return
+        discard_staging(install)  # nothing staged, or staged before this build
+
+        release = latest_release()
+        if release is None:
+            return
+        if not release.url or not has_room_for(release.size, install.parent):
+            self.events.put(("update", release.tag))
+            return
+
+        self.events.put(("update_downloading", release.tag))
+        try:
+            stage_update(release, install, self._report_download)
+        except Exception:  # noqa: BLE001 - any staging failure is just a link
+            discard_staging(install)
+            self.events.put(("update", release.tag))
+            return
+        self.events.put(("update_ready", release.tag))
+
+    def _report_download(self, received: int, total: int) -> None:
+        """Called per megabyte on the update thread; only whole percents cross."""
+        percent = int(received * 100 / total) if total else 0
+        if percent != self.update_percent:
+            self.update_percent = percent
+            self.events.put(("update_progress", percent))
+
+    def _show_update_link(self, text: str, action: str | None) -> None:
+        self.update_action = action
+        self.update_link.configure(text=text, cursor="hand2" if action else "arrow")
+        self.update_link.grid()
+
+    def _on_update_link(self) -> None:
+        if self.update_action == "browser":
+            webbrowser.open(RELEASES_PAGE)
+        elif self.update_action == "install":
+            self._install_update()
+
+    def _install_update(self) -> None:
+        """Start the helper, then close: it swaps the folders and reopens the app."""
+        if self.worker and self.worker.is_alive():
+            self.status.configure(text="Đang dịch — cài bản mới sau khi xong")
+            return
+        install = install_directory()
+        if install is None or not self._confirm_install():
+            return
+        try:
+            launch_updater(install)
+        except OSError:
+            self._show_update_link(f"● Có bản mới {self.update_tag}", "browser")
+            self.status.configure(text="Không chạy được trình cập nhật — tải thủ công")
+            return
+        self.destroy()
+
+    def _confirm_install(self) -> bool:
+        """A modal yes/no. Tk has no return value for a window, so it carries one."""
+        answer = {"install": False}
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Cài bản mới")
+        dialog.geometry("420x190")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            dialog, text=f"Bản {self.update_tag} đã tải xong", anchor="w",
+            font=ctk.CTkFont(self.ui_font, size=15, weight="bold"),
+        ).grid(row=0, column=0, padx=EDGE, pady=(EDGE, PAD), sticky="ew")
+
+        ctk.CTkLabel(
+            dialog, text="App sẽ đóng, cài bản mới rồi tự mở lại. Mất khoảng 10 giây.",
+            anchor="w", justify="left", wraplength=370,
+            font=ctk.CTkFont(self.ui_font, size=12), text_color=MUTED,
+        ).grid(row=1, column=0, padx=EDGE, pady=(0, GAP), sticky="ew")
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.grid(row=2, column=0, padx=EDGE, pady=(0, EDGE), sticky="ew")
+
+        def accept() -> None:
+            answer["install"] = True
+            dialog.destroy()
+
+        ctk.CTkButton(
+            buttons, text="Cài & khởi động lại", width=180, height=34, command=accept,
+            font=ctk.CTkFont(self.ui_font, size=13),
+        ).pack(side="right")
+        ctk.CTkButton(
+            buttons, text="Để sau", width=100, height=34,
+            fg_color="transparent", border_width=1, border_color=BORDER_IDLE,
+            text_color=MUTED, hover_color=HOVER, command=dialog.destroy,
+            font=ctk.CTkFont(self.ui_font, size=13),
+        ).pack(side="right", padx=(0, PAD))
+
+        # Grab only after the window exists, or Tk raises on some platforms.
+        dialog.after(120, dialog.grab_set)
+        self.wait_window(dialog)
+        return answer["install"]
+
+    # -- work --------------------------------------------------------------
     def _start(self) -> None:
         if self.worker and self.worker.is_alive():
             return
-        pending = [path for path in self.files if self.states[path] in ("queued", "failed")]
+        pending = [path for path in self.files if self.states[path] in ("queued", "failed", "paused")]
         if not pending:
             self.status.configure(text="Không còn file nào cần dịch")
             return
 
         names = {name: code for code, name in LANGUAGE_NAMES.items()}
         language = names[self.language.get()]
+        ocr_names = {name: mode for mode, name in OCR_NAMES.items()}
+        ocr = ocr_names[self.ocr.get()]
         overwrite = bool(self.overwrite.get())
 
         self.translate_button.configure(state="disabled", text="Đang dịch…")
@@ -587,11 +841,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self.batch_done, self.batch_total = 0, len(pending)
         self.worker = threading.Thread(
-            target=self._run, args=(pending, language, overwrite), daemon=True
+            target=self._run, args=(pending, language, overwrite, ocr), daemon=True
         )
         self.worker.start()
 
-    def _run(self, files: list[Path], language: str, overwrite: bool) -> None:
+    def _run(
+        self, files: list[Path], language: str, overwrite: bool, ocr: str
+    ) -> None:
         for index, path in enumerate(files, 1):
             self.events.put(("status", path, "running", "", None))
             destination = path.parent / "translated"
@@ -599,47 +855,138 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             def report(done: int, total: int, _p: Path = path) -> None:
                 self.events.put(("page", _p, done, total))
 
+            def stage(name: str, done: int, total: int, _p: Path = path) -> None:
+                self.events.put(("stage", _p, name, done, total))
+
             try:
-                result = translate_pdf(
-                    path,
-                    destination,
-                    target_language=language,
-                    overwrite=overwrite,
-                    on_progress=report,
-                )
-                detail = (
-                    f"{result.untranslated} đoạn chưa dịch được"
-                    if result.untranslated
-                    else str(result.path)
-                )
-                state = "partial" if result.untranslated else "done"
+                with google_diagnostics(destination):
+                    result = translate_pdf(
+                        path,
+                        destination,
+                        target_language=language,
+                        overwrite=overwrite,
+                        on_progress=report,
+                        on_status=stage,
+                        ocr=ocr,
+                    )
+                state, detail = translation_outcome(result)
                 self.events.put(("status", path, state, detail, result.path))
-            except TranslationError as error:
-                # One unreadable or already-translated file must not stop the batch.
-                state = "skipped" if "already exists" in str(error) else "failed"
-                if state == "failed":
-                    self._log_failure(destination, path, error)
-                self.events.put(("status", path, state, str(error), None))
             except Exception as error:  # noqa: BLE001 - keep the queue moving
-                self._log_failure(destination, path, error)
-                self.events.put(("status", path, "failed", f"{type(error).__name__}: {error}", None))
+                # One unreadable or already-translated file must not stop the batch.
+                failure = describe_failure(error)
+                state = "skipped" if failure.code == "E-OUT-05" else "failed"
+                if failure.code in ("E-NET-08", "E-NET-09"):
+                    state = "paused"
+                log = self._log_failure(destination, path, error) if state in ("failed", "paused") else None
+                self.failures[path] = (failure, log)
+                self.events.put(("status", path, state, failure.headline, None))
+                if state == "paused":
+                    # Keep remaining files queued and avoid repeating OCR/model work.
+                    break
             self.events.put(("progress", index / len(files), index, len(files)))
         self.events.put(("finished",))
 
     @staticmethod
-    def _log_failure(destination: Path, source: Path, error: BaseException) -> None:
-        """Append the full traceback to a log file the user can send back.
+    def _log_failure(destination: Path, source: Path, error: BaseException) -> Path | None:
+        """Append the full traceback to a log file, and say where it went.
 
         The queue row only has space for one line, which is never enough to
         diagnose a failure on someone else's document.
         """
         try:
             destination.mkdir(parents=True, exist_ok=True)
-            with (destination / "pdf-translate.log").open("a", encoding="utf-8") as log:
+            path = destination / "pdf-translate.log"
+            with path.open("a", encoding="utf-8") as log:
                 log.write(f"\n{'=' * 70}\n{datetime.now():%Y-%m-%d %H:%M:%S}  {source}\n")
                 traceback.print_exception(type(error), error, error.__traceback__, file=log)
+            return path
         except OSError:
-            pass  # a failure to log must never mask the failure being logged
+            return None  # a failure to log must never mask the failure being logged
+
+    def _row_clicked(self, path: Path) -> None:
+        """A finished row opens its result; a failed one explains itself."""
+        produced = self.outputs.get(path)
+        if produced is not None:
+            self._open(produced)
+            return
+        entry = self.failures.get(path)
+        if entry is not None:
+            self._show_failure(path, *entry)
+
+    def _show_failure(self, path: Path, failure: Failure, log: Path | None) -> None:
+        """Show the whole error, with one action that makes it reportable.
+
+        Users were being handed a clipped English exception with no way to read
+        or copy it, so they could not say what had gone wrong. Everything the
+        maintainer needs is one button away.
+        """
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Chi tiết lỗi")
+        dialog.geometry("640x460")
+        dialog.transient(self)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(3, weight=1)
+
+        ctk.CTkLabel(
+            dialog, text=path.name, anchor="w", justify="left", wraplength=580,
+            font=ctk.CTkFont(self.mono_font, size=12), text_color=MUTED,
+        ).grid(row=0, column=0, padx=EDGE, pady=(EDGE, 0), sticky="ew")
+
+        ctk.CTkLabel(
+            dialog, text=f"{failure.summary}  [{failure.code}]", anchor="w",
+            justify="left", wraplength=580,
+            font=ctk.CTkFont(self.ui_font, size=15, weight="bold"),
+            text_color=STATUS_COLORS["failed"],
+        ).grid(row=1, column=0, padx=EDGE, pady=(PAD, 0), sticky="ew")
+
+        ctk.CTkLabel(
+            dialog, text=failure.advice, anchor="w", justify="left", wraplength=580,
+            font=ctk.CTkFont(self.ui_font, size=12),
+        ).grid(row=2, column=0, padx=EDGE, pady=(PAD, GAP), sticky="ew")
+
+        details = ctk.CTkTextbox(
+            dialog, wrap="word", font=ctk.CTkFont(self.mono_font, size=11),
+        )
+        details.grid(row=3, column=0, padx=EDGE, sticky="nsew")
+        report = report_text(failure, path, APP_VERSION, log)
+        details.insert("1.0", report)
+        details.configure(state="disabled")
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.grid(row=4, column=0, padx=EDGE, pady=GAP, sticky="ew")
+
+        copied = ctk.CTkLabel(
+            buttons, text="", font=ctk.CTkFont(self.ui_font, size=11),
+            text_color=STATUS_COLORS["done"],
+        )
+
+        def copy_report() -> None:
+            self.clipboard_clear()
+            self.clipboard_append(report)
+            copied.configure(text="Da sao chep")
+
+        ctk.CTkButton(
+            buttons, text="Sao chép báo cáo", width=150, height=32,
+            command=copy_report, font=ctk.CTkFont(self.ui_font, size=13),
+        ).pack(side="left")
+        if log is not None:
+            ctk.CTkButton(
+                buttons, text="Mở file log", width=120, height=32,
+                fg_color="transparent", border_width=1, border_color=BORDER_IDLE,
+                text_color=ACCENT, hover_color=HOVER,
+                command=lambda: self._open(log),
+                font=ctk.CTkFont(self.ui_font, size=13),
+            ).pack(side="left", padx=(PAD, 0))
+        ctk.CTkButton(
+            buttons, text="Đóng", width=90, height=32,
+            fg_color="transparent", border_width=1, border_color=BORDER_IDLE,
+            text_color=MUTED, hover_color=HOVER, command=dialog.destroy,
+            font=ctk.CTkFont(self.ui_font, size=13),
+        ).pack(side="right")
+        copied.pack(side="right", padx=(0, PAD))
+
+        # Grab only after the window exists, or Tk raises on some platforms.
+        dialog.after(120, dialog.grab_set)
 
     def _go_determinate(self) -> None:
         """Switch off the spinner the moment there is a real number to show."""
@@ -650,6 +997,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.determinate = True
 
     def _drain_events(self) -> None:
+        try:
+            self._handle_events()
+        finally:
+            # Always rearm. An exception escaping here used to cancel the only
+            # scheduled callback, freezing every later status in the batch and
+            # making one bad file look as though the whole queue had failed.
+            self.after(100, self._drain_events)
+
+    def _handle_events(self) -> None:
         while True:
             try:
                 event = self.events.get_nowait()
@@ -664,14 +1020,40 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 self.states[path] = state
                 row = self.rows[path]
                 first_line = detail.splitlines()[0] if detail else ""
-                row.set_state(
-                    state,
-                    first_line if state in ("failed", "skipped", "partial") else "",
-                )
-                if path in self.outputs:
-                    for widget in (row.frame, row.mark, row.name, row.detail):
+                if state in ("failed", "skipped"):
+                    # The whole reason, wrapped under the name, plus an
+                    # invitation to open the rest.
+                    row.set_state(state, "", f"{first_line}  -  bấm để xem chi tiết")
+                elif state == "paused":
+                    row.set_state(state, "Tạm dừng", self.failures[path][0].advice)
+                elif state == "partial":
+                    row.set_state(state, "", first_line)
+                else:
+                    row.set_state(state, "")
+                clickable = self.outputs.get(path) is not None or path in self.failures
+                if clickable:
+                    for widget in (row.frame, row.mark, row.name, row.detail, row.message):
                         widget.configure(cursor="hand2")
-                        widget.bind("<Button-1>", lambda _e, p=path: self._open(self.outputs.get(p)))
+                        widget.bind("<Button-1>", lambda _e, p=path: self._row_clicked(p))
+            elif event[0] == "stage":
+                _, path, stage, done, total = event
+                if self.states.get(path) != "running":
+                    continue
+                labels = {
+                    "preparing": "Đang chuẩn bị",
+                    "ocr": "Đang nhận dạng chữ OCR",
+                    "translating": "Đang phân tích bố cục và dịch",
+                    "layout": "Đang phân tích bố cục",
+                    "request": "Đang chờ bản dịch từ Google",
+                    "waiting": "Kết nối gián đoạn — đang chờ thử lại",
+                    "saving": "Đang xuất PDF",
+                }
+                label = labels.get(stage, "Đang xử lý")
+                if total:
+                    label += f" · trang {done}/{total}"
+                self.status.configure(text=f"{label} · {path.name}")
+                if stage == "ocr" and total:
+                    self.rows[path].detail.configure(text=f"OCR {done}/{total}")
             elif event[0] == "page":
                 # Per-page progress inside the file being translated. A textbook
                 # is hundreds of pages, so file-level progress alone looks stuck.
@@ -687,8 +1069,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 self._go_determinate()
                 self.progress.set(fraction)
             elif event[0] == "update":
-                self.update_link.configure(text=f"● Có bản mới {event[1]}")
-                self.update_link.grid()
+                self.update_tag = event[1]
+                self._show_update_link(f"● Có bản mới {event[1]}", "browser")
+            elif event[0] == "update_downloading":
+                self.update_tag = event[1]
+                self._show_update_link(f"↓ Đang tải bản mới {event[1]}…", None)
+            elif event[0] == "update_progress":
+                self._show_update_link(f"↓ Đang tải {self.update_tag} — {event[1]}%", None)
+            elif event[0] == "update_ready":
+                self.update_tag = event[1]
+                self._show_update_link(f"● Cài {event[1]} & khởi động lại", "install")
             elif event[0] == "finished":
                 self.translate_button.configure(state="normal", text="Dịch")
                 self.clear_button.configure(state="normal")
@@ -701,8 +1091,30 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     summary += f", {counts['partial']} file dịch thiếu"
                 if counts.get("failed"):
                     summary += f", {counts['failed']} file lỗi"
+                if counts.get("paused"):
+                    summary = "Đã tạm dừng · Phần đã dịch được lưu để dùng lại"
+                    if counts.get("queued"):
+                        summary += f" · {counts['queued']} file đang chờ"
+                    self.translate_button.configure(text="Tiếp tục dịch")
                 self.status.configure(text=summary)
-        self.after(100, self._drain_events)
+
+
+def verify_engine() -> None:
+    """Load everything a translation needs, and fail loudly if it cannot.
+
+    A window that opens proves Tk works and nothing else. The bug that reached
+    users last time was pikepdf's compiled extension failing to find its qpdf
+    DLL in the frozen bundle - invisible until someone pressed Dich on a real
+    document. These imports are the rest of the native stack: PDF read/write,
+    the repair path, and the onnxruntime session behind layout detection.
+    """
+    import pdf2zh.high_level  # noqa: F401 - pulls pikepdf, pymupdf and qpdf
+    import pikepdf._core  # noqa: F401 - the extension that failed on its own
+    import pymupdf  # noqa: F401
+    from pdf2zh.ocr import verify_ocr_runtime
+
+    load_layout_model()
+    verify_ocr_runtime()
 
 
 def main() -> None:
@@ -719,9 +1131,18 @@ def main() -> None:
     arguments = [argument for argument in sys.argv[1:] if argument != "--smoke-test"]
     if "--smoke-test" in sys.argv[1:]:
         # CI uses this to prove the frozen executable can load Tk, TkDND and all
-        # native libraries on the Mac architecture that produced the bundle.
+        # native libraries on the architecture that produced the bundle.
         app.withdraw()
         app.update_idletasks()
+        try:
+            verify_engine()
+        except BaseException as error:  # noqa: BLE001 - the exit code is the result
+            # Never let this reach PyInstaller's windowed traceback dialog: it
+            # would wait for a click that a build machine cannot give, turning
+            # a failed check into a job that hangs until it times out.
+            print(f"smoke test failed: {error!r}", file=sys.stderr)
+            app.destroy()
+            raise SystemExit(1) from None
         app.destroy()
         return
     # Desktop shells can pass files dropped on the executable icon as arguments.

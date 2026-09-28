@@ -2,17 +2,61 @@ from __future__ import annotations
 
 import argparse
 import tempfile
+from collections import Counter
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from pdf2zh.high_level import TranslationReport
 from scripts import translate_pdf
+
+
+class FailureReportingTests(unittest.TestCase):
+    def test_an_over_long_segment_is_reported_as_its_own_reason(self):
+        """Truncating it silently loses the tail; saying so lets the user act.
+
+        It is neither a fit failure nor a dead connection, and telling the user
+        their network is down would send them to check the wrong thing.
+        """
+        lines = translate_pdf._describe_failures(Counter({"SegmentTooLongError": 2}))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("2 segments", lines[0])
+        self.assertIn("longer than the translation service accepts", lines[0])
+
+    def test_each_kind_of_failure_gets_its_own_line(self):
+        lines = translate_pdf._describe_failures(
+            Counter(
+                {
+                    "SegmentTooLongError": 1,
+                    "FormulaPlaceholderError": 1,
+                    "single line needs less than 50% font size": 1,
+                    "ConnectionError": 1,
+                }
+            )
+        )
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(
+            sum("translation engine failed" in line for line in lines), 1
+        )
+
+    def test_a_blocked_network_is_named_apart_from_a_dead_connection(self):
+        """A block asks the user to wait or move network; retrying at once does
+        nothing. A dead connection asks them to reconnect."""
+        lines = translate_pdf._describe_failures(
+            Counter({"RateLimitedError": 30, "ServiceUnavailableError": 2})
+        )
+        self.assertEqual(len(lines), 2)
+        self.assertIn("30 segments", lines[0])
+        self.assertIn("HTTP 429", lines[0])
+        self.assertIn("2 segments", lines[1])
+        self.assertIn("did not answer", lines[1])
+        self.assertFalse(any("translation engine failed" in line for line in lines))
 
 
 class TranslatePdfTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_directory.name)
+        self.root = Path(self.temp_directory.name).resolve()
         self.source = self.root / "guide.pdf"
         self.source.write_bytes(b"%PDF-1.7\nsource")
         self.output = self.root / "output"
@@ -25,7 +69,8 @@ class TranslatePdfTests(unittest.TestCase):
         (Path(temp_output) / f"{Path(source).stem}-mono.pdf").write_bytes(
             b"%PDF-1.7\ntranslated"
         )
-        return 0  # the real runner returns the untranslated segment count
+        # The real runner hands back what the core could not translate, and why.
+        return TranslationReport(translatable_segments=12)
 
     @mock.patch.object(translate_pdf, "_require_core")
     @mock.patch.object(translate_pdf, "_run_engine")
@@ -67,6 +112,16 @@ class TranslatePdfTests(unittest.TestCase):
         self.assertEqual(translate_pdf._pages_to_indices("1,3-5"), [0, 2, 3, 4])
         with self.assertRaises(argparse.ArgumentTypeError):
             translate_pdf._page_selection("5-3")
+
+    def test_ocr_profile_is_opt_in_at_the_cli_boundary(self):
+        args = translate_pdf._parser().parse_args(
+            ["guide.pdf", "--output-dir", "out", "--ocr", "standard"]
+        )
+        self.assertEqual(args.ocr, "standard")
+        self.assertEqual(
+            translate_pdf._parser().parse_args(["guide.pdf", "--output-dir", "out"]).ocr,
+            "off",
+        )
 
     def test_requires_the_bundled_core_instead_of_the_pypi_wheel(self):
         translate_pdf._require_core()
@@ -118,7 +173,11 @@ class TranslatePdfTests(unittest.TestCase):
     def test_reports_segments_the_engine_could_not_translate(self):
         def partial(source, temp_output, *_args):
             (Path(temp_output) / f"{Path(source).stem}-mono.pdf").write_bytes(b"%PDF-1.7\n")
-            return 7
+            return TranslationReport(
+                failures=["a"] * 7,
+                reasons=Counter({"ConnectionError": 7}),
+                translatable_segments=40,
+            )
 
         with (
             mock.patch.object(translate_pdf, "_require_core"),
@@ -129,6 +188,76 @@ class TranslatePdfTests(unittest.TestCase):
         # A document that lost some segments must still be delivered, and say so.
         self.assertEqual(result.path, self.output / "guide-vi.pdf")
         self.assertEqual(result.untranslated, 7)
+
+    def test_refuses_a_document_with_no_extractable_text(self):
+        """An image-only scan must not be handed over as a finished translation."""
+        def scanned(source, temp_output, *_args):
+            (Path(temp_output) / f"{Path(source).stem}-mono.pdf").write_bytes(b"%PDF")
+            return TranslationReport(
+                image_only_pages={0, 1, 2, 3}, translatable_segments=0, pages_processed=4
+            )
+
+        with (
+            mock.patch.object(translate_pdf, "_require_core"),
+            mock.patch.object(translate_pdf, "_run_engine", side_effect=scanned),
+        ):
+            with self.assertRaises(translate_pdf.TranslationError) as caught:
+                translate_pdf.translate_pdf(self.source, self.output)
+
+        message = str(caught.exception)
+        self.assertIn("image-only", message)
+        self.assertIn("OCR", message)
+        # Nothing may be written: a file on disk is what made this look like success.
+        self.assertFalse((self.output / "guide-vi.pdf").exists())
+
+    def test_reports_image_only_pages_of_a_mixed_document(self):
+        def mixed(source, temp_output, *_args):
+            (Path(temp_output) / f"{Path(source).stem}-mono.pdf").write_bytes(b"%PDF")
+            return TranslationReport(image_only_pages={2, 6}, translatable_segments=30)
+
+        with (
+            mock.patch.object(translate_pdf, "_require_core"),
+            mock.patch.object(translate_pdf, "_run_engine", side_effect=mixed),
+        ):
+            result = translate_pdf.translate_pdf(self.source, self.output)
+
+        # Delivered, because the rest of it translated, but the gaps are named.
+        self.assertEqual(result.path, self.output / "guide-vi.pdf")
+        self.assertEqual(result.image_only_pages, (2, 6))
+
+    def test_layout_failures_are_not_reported_as_a_network_problem(self):
+        """The bug this guards: every skipped segment blamed the translation service."""
+        lines = translate_pdf._describe_failures(
+            Counter({"single line needs less than 50% font size": 5})
+        )
+
+        self.assertEqual(len(lines), 1)
+        self.assertIn("did not fit", lines[0])
+        for wrong in ("service", "engine failed", "reach"):
+            self.assertNotIn(wrong, lines[0])
+
+    def test_damaged_formula_markers_are_reported_as_their_own_cause(self):
+        lines = translate_pdf._describe_failures(Counter({"FormulaPlaceholderError": 1}))
+
+        self.assertEqual(len(lines), 1)
+        self.assertIn("formula", lines[0])
+        self.assertTrue(lines[0].startswith("1 segment "), lines[0])
+
+    def test_each_cause_is_reported_separately(self):
+        lines = translate_pdf._describe_failures(
+            Counter({
+                "table cell cannot fit at 50% font size": 2,
+                "rotated text needs less than 50% font size": 1,
+                "FormulaPlaceholderError": 4,
+                "ConnectionError": 3,
+            })
+        )
+
+        self.assertEqual(len(lines), 3)
+        joined = " | ".join(lines)
+        self.assertIn("3 segments", joined)
+        self.assertIn("4 segments", joined)
+        self.assertIn("ConnectionError x3", joined)
 
     def test_target_language_is_limited_to_latin_script(self):
         self.assertEqual(translate_pdf._target_language("FR"), "fr")
